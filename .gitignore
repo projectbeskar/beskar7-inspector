@@ -1,0 +1,27 @@
+# Build outputs
+build/
+dist/
+*.img
+*.iso
+vmlinuz*
+initrd*
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test artifacts
+test-results/
+*.test
+
+# Docker
+.dockerignore
+
