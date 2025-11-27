@@ -71,10 +71,10 @@ test:
 
 test-vm: build
 	@echo "$(GREEN)Testing in QEMU...$(NC)"
-	@if ! command -v qemu-system-x86_64 &> /dev/null; then \
-		echo "$(RED)ERROR: QEMU not installed$(NC)"; \
+	@which qemu-system-x86_64 > /dev/null 2>&1 || { \
+		echo "$(RED)ERROR: QEMU not installed. Install with: apt install qemu-system-x86$(NC)"; \
 		exit 1; \
-	fi
+	}
 	qemu-system-x86_64 \
 		-m 2048 \
 		-kernel $(BUILD_DIR)/vmlinuz \
