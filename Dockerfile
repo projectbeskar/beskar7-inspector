@@ -67,7 +67,7 @@ RUN mkdir -p /build/initramfs-root/bin && \
 # Copy busybox and create symlinks
 RUN cp /bin/busybox /build/initramfs-root/bin/ && \
     cd /build/initramfs-root/bin && \
-    for cmd in sh ash bash mount umount ls cat echo mkdir rm cp mv ln grep sed awk cut tr sleep wget curl which find xargs test [ head tail sort uniq wc date hostname; do \
+    for cmd in sh ash bash mount umount ls cat echo mkdir rm cp mv ln grep sed awk cut tr sleep wget curl which find xargs test [ head tail sort uniq wc date hostname tee paste seq yes readlink basename dirname touch; do \
         ln -sf busybox $cmd 2>/dev/null || true; \
     done
 

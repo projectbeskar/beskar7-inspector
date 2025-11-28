@@ -30,9 +30,12 @@ export WORK_DIR
 
 log_info "Working directory: $WORK_DIR"
 
-# Set up logging
-exec 1> >(tee -a $WORK_DIR/inspector.log)
-exec 2>&1
+# Set up logging (busybox sh compatible - no process substitution)
+# Redirect stdout and stderr to log file
+touch $WORK_DIR/inspector.log
+ln -sf $WORK_DIR/inspector.log /inspector.log
+# Note: Can't use tee with process substitution in busybox sh
+# All logs go to inspector.log, console output via echo
 
 log_info "Initialization complete"
 

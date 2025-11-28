@@ -58,7 +58,8 @@ MEM_TOTAL_GB=$((MEM_TOTAL_KB / 1024 / 1024))
 log_info "  Total Memory: ${MEM_TOTAL_GB}GB"
 
 # Detailed memory info from dmidecode
-MEMORY_MODULES=$(dmidecode -t memory 2>/dev/null | grep -A 20 "Memory Device" | grep -E "Size|Type:|Speed:|Locator:" | paste - - - - | grep -v "No Module" || echo "")
+# Note: paste command joins lines, but we'll use a simpler approach for busybox
+MEMORY_MODULES=$(dmidecode -t memory 2>/dev/null | grep -A 5 "Memory Device" | grep -E "Size:|Type:|Speed:" | head -20 || echo "")
 
 # Disk Information
 log_info "Detecting disk information..."
@@ -85,7 +86,8 @@ EOF
 
 # Add CPU info
 FIRST_CPU=true
-for i in $(seq 0 $((CPU_COUNT - 1))); do
+i=0
+while [ $i -lt $CPU_COUNT ]; do
     if [ "$FIRST_CPU" = false ]; then
         echo "," >> $REPORT_FILE
     fi
@@ -101,6 +103,7 @@ for i in $(seq 0 $((CPU_COUNT - 1))); do
       "frequency": "${CPU_MHZ:-0}MHz"
     }
 CPUEOF
+    i=$((i + 1))
 done
 
 cat >> $REPORT_FILE << EOF
@@ -127,7 +130,7 @@ EOF
 
 # Add disk info
 FIRST_DISK=true
-while IFS= read -r disk_json; do
+echo "$DISKS_JSON" | while IFS= read -r disk_json; do
     if [ -z "$disk_json" ]; then continue; fi
     
     if [ "$FIRST_DISK" = false ]; then
@@ -162,7 +165,7 @@ while IFS= read -r disk_json; do
       "serialNumber": "$DISK_SERIAL"
     }
 DISKEOF
-done <<< "$DISKS_JSON"
+done
 
 cat >> $REPORT_FILE << EOF
 
@@ -172,7 +175,7 @@ EOF
 
 # Add NIC info
 FIRST_NIC=true
-while IFS= read -r nic_json; do
+echo "$NICS_JSON" | while IFS= read -r nic_json; do
     if [ -z "$nic_json" ]; then continue; fi
     
     if [ "$FIRST_NIC" = false ]; then
@@ -212,7 +215,7 @@ while IFS= read -r nic_json; do
       "ipAddresses": ["$NIC_IPS"]
     }
 NICEOF
-done <<< "$NICS_JSON"
+done
 
 cat >> $REPORT_FILE << EOF
 

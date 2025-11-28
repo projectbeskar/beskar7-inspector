@@ -3,7 +3,7 @@
 
 set -e
 
-source /opt/beskar7-inspector/utils.sh
+. /opt/beskar7-inspector/utils.sh
 
 log_info "===== Kexec into Target OS ====="
 
