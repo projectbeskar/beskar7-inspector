@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
 
 [dev-dependencies]
 # Only the contract round-trip test serializes/deserializes today; serde_json
