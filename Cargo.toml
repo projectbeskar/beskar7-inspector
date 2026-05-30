@@ -1,0 +1,37 @@
+[package]
+name = "beskar7-inspector"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+description = "Hardware-inspection ramdisk for the Beskar7 Cluster API bare-metal provider"
+repository = "https://github.com/projectbeskar/beskar7-inspector"
+publish = false
+
+# The crate ships as a static binary used directly as the initramfs /init, but
+# is split lib + thin bin so the contract types, probes, client, and kexec
+# modules are unit- and contract-testable.
+[lib]
+name = "beskar7_inspector"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beskar7-inspector"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+# Only the contract round-trip test serializes/deserializes today; serde_json
+# graduates to a runtime dependency when the callback client (src/client.rs)
+# lands.
+serde_json = "1.0"
+
+[profile.release]
+# The shipped artifact is an initramfs binary: optimize for size and strip.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
