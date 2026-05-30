@@ -6,6 +6,7 @@
 //! without booting a ramdisk.
 
 pub mod cmdline;
+pub mod probe;
 pub mod report;
 pub mod secret;
 pub mod smbios;
