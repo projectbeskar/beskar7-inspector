@@ -1,4 +1,9 @@
-# Build outputs
+# Rust build output
+/target/
+**/*.rs.bk
+# Cargo.lock IS committed for this crate (it builds a binary, not a library).
+
+# Initramfs / image build outputs
 build/
 dist/
 *.img
@@ -25,3 +30,8 @@ test-results/
 # Docker
 .dockerignore
 
+# Local development tooling configuration (per-developer, not shared).
+# Mirrors the beskar7 repo: the Claude agents, CLAUDE.md, and the
+# .claude/context working-memory file are local, not committed.
+/.claude/
+/CLAUDE.md
