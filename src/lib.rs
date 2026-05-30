@@ -5,7 +5,9 @@
 //! orchestrator over this library so every module is unit- and contract-testable
 //! without booting a ramdisk.
 
+pub mod cmdline;
 pub mod report;
+pub mod secret;
 
 /// The controller↔inspector contract version this build implements
 /// (`docs/inspector-contract.md` in the beskar7 repo).
