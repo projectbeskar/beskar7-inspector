@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use super::cleaned;
 use crate::smbios::Structure;
 
 /// SMBIOS structure type: BIOS Information (DSP0134 §7.1).
@@ -82,11 +83,6 @@ impl SystemInfo {
 /// taking the first.
 fn find_type(structures: &[Structure], header_type: u8) -> Option<&Structure> {
     structures.iter().find(|s| s.header_type == header_type)
-}
-
-/// Trim surrounding whitespace SMBIOS strings are often padded with; absent ⇒ "".
-fn cleaned(value: Option<&str>) -> String {
-    value.map(str::trim).unwrap_or_default().to_string()
 }
 
 #[cfg(test)]
