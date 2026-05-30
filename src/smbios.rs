@@ -231,33 +231,41 @@ fn parse_string_set(
     }
 }
 
+/// Encode one SMBIOS structure: 4-byte header, `formatted` fields, then the
+/// string set (`00 00` when empty, else each string NUL-terminated followed by
+/// the closing NUL). Shared across the crate's unit tests — here and the probe
+/// collectors — so every test builds fixtures the same, spec-correct way.
+#[cfg(test)]
+pub(crate) fn encode_structure(
+    header_type: u8,
+    handle: u16,
+    formatted: &[u8],
+    strings: &[&str],
+) -> Vec<u8> {
+    let length = 4 + formatted.len();
+    let mut v = vec![
+        header_type,
+        length as u8,
+        (handle & 0xff) as u8,
+        (handle >> 8) as u8,
+    ];
+    v.extend_from_slice(formatted);
+    if strings.is_empty() {
+        v.extend_from_slice(&[0, 0]);
+    } else {
+        for s in strings {
+            v.extend_from_slice(s.as_bytes());
+            v.push(0);
+        }
+        v.push(0); // closing NUL of the double-NUL terminator
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
+    use super::encode_structure as structure;
     use super::*;
-
-    /// Encode one SMBIOS structure: 4-byte header, `formatted` fields, then the
-    /// string set (`00 00` when empty, else each string NUL-terminated followed
-    /// by the closing NUL).
-    fn structure(header_type: u8, handle: u16, formatted: &[u8], strings: &[&str]) -> Vec<u8> {
-        let length = 4 + formatted.len();
-        let mut v = vec![
-            header_type,
-            length as u8,
-            (handle & 0xff) as u8,
-            (handle >> 8) as u8,
-        ];
-        v.extend_from_slice(formatted);
-        if strings.is_empty() {
-            v.extend_from_slice(&[0, 0]);
-        } else {
-            for s in strings {
-                v.extend_from_slice(s.as_bytes());
-                v.push(0);
-            }
-            v.push(0); // closing NUL of the double-NUL terminator
-        }
-        v
-    }
 
     #[test]
     fn parses_single_structure_with_strings() {
