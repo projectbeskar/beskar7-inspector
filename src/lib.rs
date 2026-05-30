@@ -8,6 +8,7 @@
 pub mod cmdline;
 pub mod report;
 pub mod secret;
+pub mod smbios;
 
 /// The controller↔inspector contract version this build implements
 /// (`docs/inspector-contract.md` in the beskar7 repo).
