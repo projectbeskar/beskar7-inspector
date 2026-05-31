@@ -5,6 +5,7 @@
 //! orchestrator over this library so every module is unit- and contract-testable
 //! without booting a ramdisk.
 
+pub mod client;
 pub mod cmdline;
 pub mod probe;
 pub mod report;

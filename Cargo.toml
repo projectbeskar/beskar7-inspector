@@ -28,13 +28,34 @@ path = "src/main.rs"
 # hand-rolled getifaddrs FFI in a memory-safe binary.
 nix = { version = "0.29", default-features = false, features = ["net"] }
 serde = { version = "1.0", features = ["derive"] }
+# Serialize the InspectionReport into the POST body for the callback client
+# (src/client.rs). Was a dev-dependency (contract round-trip test only) until the
+# client landed; it is now a runtime dependency.
+serde_json = "1.0"
 thiserror = "2.0"
 
-[dev-dependencies]
-# Only the contract round-trip test serializes/deserializes today; serde_json
-# graduates to a runtime dependency when the callback client (src/client.rs)
-# lands.
-serde_json = "1.0"
+# Synchronous, rustls-backed HTTP client for the callback POST/GET (contract
+# §4.2/§4.3). Chosen over reqwest because the inspector is a sequential PID 1
+# init with no need for an async runtime — ureq avoids tokio/hyper, shrinking the
+# static binary and the dependency surface. Pinned to the 2.x line: ureq 3.x
+# raises its MSRV to 1.85, above this crate's declared 1.74. default-features off
+# drops gzip/brotli/cookies/charset we don't need; `tls` re-enables rustls.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+# rustls is a direct dependency so the client can build a ClientConfig whose root
+# store trusts ONLY the CA delivered on the cmdline (contract §8). Pinned to the
+# 0.23 line ureq uses, so cargo unifies to one rustls. default-features off with
+# an explicit `ring` provider keeps aws-lc-rs — which needs a C toolchain and
+# complicates the static-musl build — out of the tree entirely.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+# Parse the base64-decoded `beskar7.ca` PEM into certificates for the root store.
+rustls-pemfile = "2"
+# Decode the base64-encoded `beskar7.ca` PEM string from the cmdline (§5/§8).
+base64 = "0.22"
 
 [profile.release]
 # The shipped artifact is an initramfs binary: optimize for size and strip.
