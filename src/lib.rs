@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod cmdline;
+pub mod image;
 pub mod probe;
 pub mod report;
 pub mod secret;

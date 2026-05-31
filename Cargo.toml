@@ -54,6 +54,12 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 # Parse the base64-decoded `beskar7.ca` PEM into certificates for the root store.
 rustls-pemfile = "2"
+# Incrementally hash the target whole-disk image as it streams to disk, so the
+# inspector verifies it against `beskar7.target-digest` without buffering the
+# multi-GB body in RAM (contract §8.1). The digest — not TLS — is the image's
+# sole integrity/authenticity anchor. RustCrypto's `sha2` is pure-Rust (no C
+# toolchain), keeping the static-musl build self-contained.
+sha2 = "0.10"
 # Decode the base64-encoded `beskar7.ca` PEM string from the cmdline (§5/§8).
 base64 = "0.22"
 
