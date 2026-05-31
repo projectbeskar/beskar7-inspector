@@ -17,6 +17,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
+use super::read_trimmed;
 use crate::report::Disk;
 
 /// Kernel block-device directory: one subdirectory per whole device.
@@ -111,28 +112,10 @@ fn serial(dev: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Read a sysfs attribute and trim it; `None` on any read error or when the
-/// trimmed value is empty (sysfs attributes carry a trailing newline, and some
-/// are present-but-blank).
-fn read_trimmed(path: &Path) -> Option<String> {
-    let raw = fs::read_to_string(path).ok()?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    /// Write `contents` to `<root>/<rel>`, creating parent directories. Models a
-    /// sysfs attribute (or, when `rel` ends in a directory, the `device` link as
-    /// a plain directory — `decode` only checks existence, not link-ness).
-    fn write(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, contents).unwrap();
-    }
+    use crate::probe::testutil::{write, Scratch};
 
     /// A fixed NVMe namespace mirroring the golden fixture's disks: `device/`
     /// present, not removable, size in 512-byte sectors, model + serial set.
@@ -145,28 +128,6 @@ mod tests {
             &format!("{name}/device/serial"),
             &format!("{serial}\n"),
         );
-    }
-
-    /// A unique scratch directory under the system temp dir, removed on drop.
-    struct Scratch(PathBuf);
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static SEQ: AtomicU32 = AtomicU32::new(0);
-            let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("b7-disk-{tag}-{}-{n}", std::process::id()));
-            fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
-        }
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
 
     #[test]
