@@ -12,6 +12,7 @@ pub mod cmdline;
 pub mod deploy;
 pub mod image;
 pub mod modules;
+pub mod net;
 pub mod oem;
 pub mod probe;
 pub mod report;
