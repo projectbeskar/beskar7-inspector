@@ -1,55 +1,96 @@
-//! Phase 2 deploy — write the digest-verified target image to the selected disk
-//! (contract §9.1 steps 5.1–5.2).
+//! Phase 2 deploy — write the digest-verified target image, inject the per-host
+//! config, and reboot into the provisioned OS (contract §9.1 step 5).
 //!
-//! This is the **destructive** half of provisioning's first step: stream the
-//! whole-disk OS image (`beskar7.target`) straight onto the block device chosen by
-//! [`crate::target_disk`], verifying it against `beskar7.target-digest` as it goes.
-//! The `COS_OEM` inject + `reboot(2)` (steps 5.3–5.5) follow in a later module.
+//! This is the **destructive** half of provisioning. It runs in four live steps,
+//! each gated by the one before:
+//!   1. [`write_image`] (§9.1 5.1–5.2) — stream the whole-disk OS image
+//!      (`beskar7.target`) straight onto the block device chosen by
+//!      [`crate::target_disk`], verifying it against `beskar7.target-digest`.
+//!   2. [`reread_partition_table`] (§9.1 5.3) — `BLKRRPART` so the freshly-written
+//!      image's partitions appear; the caller then locates `COS_OEM`
+//!      ([`crate::oem`]).
+//!   3. [`inject_oem_config`] (§9.1 5.3) — mount the `COS_OEM` partition
+//!      (`nodev,nosuid,noexec`), write the per-host Kairos cloud-config
+//!      (`99_beskar7.yaml`, carrying the CAPI join secret) `0600`/root, `fsync`
+//!      file + directory, and unmount.
+//!   4. [`reboot_now`] (§9.1 5.4) — `reboot(2)` into the provisioned OS.
 //!
-//! ## What this module guarantees
-//!   * **Identity before write (TOCTOU guard, §5).** The device is opened by its
-//!     `/dev/<kname>` path, then the opened node's `st_rdev` is checked against the
-//!     `major:minor` recorded at selection time ([`TargetDisk::dev_number`]). If a
-//!     `/dev` node was repointed between selection and open (udev re-enumeration,
-//!     hot-plug, a hostile actor with device-node control), the write is refused —
-//!     so the device validated by `target_disk` is provably the device written.
-//!     The opened node is also required to be a block device, and is opened
-//!     `O_EXCL` (exclusive block-device open) so a disk that is mounted or held by
-//!     another writer — outside `target_disk`'s system-backing exclusion — fails
-//!     with `EBUSY` rather than being clobbered.
-//!   * **Bounded, RAM-free, digest-gated write (§8.1).** The image is streamed to
-//!     the device by [`crate::image::ImageFetcher::fetch_to`], which hashes the
-//!     bytes incrementally (never buffering the multi-GB body) and returns `Ok`
-//!     **only** on a full-length digest match. The size bound is the smaller of
-//!     the build maximum and the disk's own capacity — a whole-disk image larger
-//!     than the disk can never deploy. On any digest mismatch, short read, or
-//!     size breach the call fails and the caller MUST NOT proceed to mount/inject/
-//!     reboot; the unbootable disk is recovered on the next provisioning attempt.
+//! ## Identity, never a re-resolvable path (TOCTOU guard, §5 / §9.1 5.3)
+//! Neither destructive operation trusts a `/dev/<kname>` path it could re-resolve
+//! to the wrong device:
+//!   * The **whole-disk write** opens `/dev/<kname>` once (`O_EXCL`), then checks
+//!     the *held fd's* `st_rdev` against [`TargetDisk::dev_number`] and that it is a
+//!     block device — the check and the write share one fd, so nothing can repoint
+//!     the device between them. `O_EXCL` also fails `EBUSY` on a mounted-but-not-
+//!     system disk rather than clobbering it.
+//!   * The **`COS_OEM` mount** does not mount a `/dev` path at all: it `mknod`s a
+//!     private block node from the partition's enumerated `major:minor`
+//!     ([`crate::oem::OemPartition::dev_number`]) and mounts that, so the mount is
+//!     bound to the exact kernel device [`crate::oem`] enumerated on the target
+//!     disk — immune to a `/dev` node being repointed between enumeration and mount.
 //!
-//! Re-reading the partition table and locating `COS_OEM` are step 5.3's job (the
-//! next module), deliberately not here: this module only lays the image down and
-//! flushes it to stable storage.
+//! ## Bounded, RAM-free, digest-gated write (§8.1)
+//! The image is streamed by [`crate::image::ImageFetcher::fetch_to`], hashing
+//! incrementally (never buffering the multi-GB body) and returning `Ok` **only**
+//! on a full-length digest match, bounded by `min(build max, disk capacity)`. On
+//! any mismatch/short-read/size-breach the caller MUST NOT proceed to
+//! mount/inject/reboot; the unbootable disk is recovered on the next attempt.
+//!
+//! ## Mount lifetime & failure cleanup (§9.1 5.4–5.5, finding H2)
+//! [`inject_oem_config`] **always unmounts `COS_OEM` before returning**, on
+//! success or failure (falling back to a lazy `MNT_DETACH` if the eager unmount is
+//! busy) — so the partition is never left mounted across a reboot or a drop to a
+//! debug shell. On an inject failure it first removes the partial `99_beskar7.yaml`
+//! (which may hold the join secret) and *then* unmounts. (Unlinking the partial
+//! frees but does not wipe its ext blocks on the target disk; that freed-block
+//! remanence is accepted — the secret lives on this disk by design, and the disk
+//! is unbootable until the next attempt overwrites the whole device.)
 //!
 //! ## Secret hygiene (§9)
-//! No secrets pass through here — the image and its digest are public; the CAPI
-//! join secret arrives separately and is injected in step 5.3. [`DeployError`]
-//! carries only device paths and `major:minor` numbers (all non-secret), so a
-//! logged error cannot leak anything sensitive.
+//! The image and its digest are public. The **CAPI join secret** flows through
+//! [`inject_oem_config`] as the `user_data` bytes: it is written **only** to the
+//! `0600`/root `99_beskar7.yaml` on the verified `COS_OEM` partition, never
+//! logged, and never placed in a [`DeployError`] (every variant carries only
+//! device paths / `major:minor` / public digests, all non-secret). The caller
+//! zeroes its `user_data` buffer after [`inject_oem_config`] returns.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::fs::{self, File, OpenOptions, Permissions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+
+use nix::errno::Errno;
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::sys::reboot::{reboot, RebootMode};
+use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 
 use crate::image::{ImageError, ImageFetcher, Sha256Digest};
+use crate::oem::OemPartition;
 use crate::target_disk::TargetDisk;
 
-/// Errors from the whole-disk write. All variants carry only non-secret material
-/// (device paths, `major:minor` numbers, public digests), so logging a
-/// `DeployError` in full is safe (§9).
+/// The per-host Kairos cloud-config filename injected into `COS_OEM`. The `99_`
+/// prefix orders it after the image's baked-in OEM configs so it wins (§9.1 5.3).
+const OEM_CONFIG_FILENAME: &str = "99_beskar7.yaml";
+/// Private mountpoint for the `COS_OEM` partition during injection. Created and
+/// removed by [`inject_oem_config`]; on a fresh boot nothing else uses it.
+const OEM_MOUNTPOINT: &str = "/run/beskar7-oem";
+/// Private block-device node [`inject_oem_config`] creates from the enumerated
+/// partition's `major:minor` and mounts — so the mount binds to the verified
+/// device number, never a `/dev` path that could be repointed (§9.1 5.3).
+const OEM_DEV_NODE: &str = "/run/beskar7-oem.dev";
+
+// BLKRRPART = _IO(0x12, 95): re-read a block device's partition table.
+nix::ioctl_none!(blkrrpart, 0x12, 95);
+
+/// Errors from the deploy path. All variants carry only non-secret material
+/// (device paths, `major:minor` numbers, public digests, syscall errnos) — never
+/// the join secret or image bytes — so logging a `DeployError` in full is safe (§9).
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
-    /// The target `/dev` node could not be opened for writing (e.g. it is held
-    /// exclusively, or permission was denied).
-    #[error("opening target disk {path} for writing")]
+    /// A `/dev` node could not be opened (e.g. held exclusively, or permission
+    /// denied).
+    #[error("opening device {path}")]
     OpenTarget {
         /// The `/dev/<kname>` path.
         path: String,
@@ -57,14 +98,14 @@ pub enum DeployError {
         #[source]
         source: std::io::Error,
     },
-    /// The opened target node is not a block device — refuse to write.
-    #[error("target {path} is not a block device — refusing to write")]
+    /// The opened node is not a block device — refuse to touch it.
+    #[error("device {path} is not a block device — refusing")]
     NotABlockDevice {
         /// The `/dev/<kname>` path.
         path: String,
     },
-    /// The target's metadata could not be read to verify its identity.
-    #[error("reading target disk {path} metadata")]
+    /// The node's metadata could not be read to verify its identity.
+    #[error("reading device {path} metadata")]
     Stat {
         /// The `/dev/<kname>` path.
         path: String,
@@ -72,21 +113,20 @@ pub enum DeployError {
         #[source]
         source: std::io::Error,
     },
-    /// The selected disk carried no `major:minor` to verify against, so device
-    /// identity cannot be confirmed — refuse to write rather than risk the wrong
-    /// device (§5).
-    #[error("target disk {path} has no recorded device number; cannot verify identity — refusing to write")]
+    /// The device carried no `major:minor` to verify against, so identity cannot
+    /// be confirmed — refuse rather than risk the wrong device (§5).
+    #[error("device {path} has no recorded device number; cannot verify identity — refusing")]
     NoDeviceNumber {
         /// The `/dev/<kname>` path.
         path: String,
     },
-    /// The opened node's `st_rdev` does not match the device selected — the `/dev`
-    /// node was repointed since selection. Refuse to write (§5 TOCTOU guard).
-    #[error("target disk {path} identity changed since selection (expected dev {expected}, found {found}) — refusing to write")]
+    /// The opened node's `st_rdev` does not match the device selected/enumerated —
+    /// the `/dev` node was repointed since. Refuse (§5 / §9.1 5.3 TOCTOU guard).
+    #[error("device {path} identity changed since selection (expected dev {expected}, found {found}) — refusing")]
     DeviceIdentityMismatch {
         /// The `/dev/<kname>` path.
         path: String,
-        /// The `major:minor` recorded at selection time.
+        /// The `major:minor` recorded at selection/enumeration time.
         expected: String,
         /// The `major:minor` of the node actually opened.
         found: String,
@@ -100,6 +140,66 @@ pub enum DeployError {
     /// Flushing the written image to stable storage failed.
     #[error("flushing target disk to stable storage")]
     Sync(#[source] std::io::Error),
+    /// Re-reading the partition table (`BLKRRPART`) failed — the freshly-written
+    /// image's partitions did not become visible.
+    #[error("re-reading the partition table of {path}")]
+    Reread {
+        /// The whole-disk `/dev/<kname>` path.
+        path: String,
+        /// The ioctl errno.
+        #[source]
+        source: Errno,
+    },
+    /// The `COS_OEM` mountpoint could not be created.
+    #[error("creating the COS_OEM mountpoint {path}")]
+    Mountpoint {
+        /// The mountpoint path.
+        path: String,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The enumerated partition `major:minor` could not be parsed, so the mount
+    /// cannot be bound to a verified device number — refuse (§9.1 5.3).
+    #[error("partition {dev} has no parseable device number; cannot bind the mount — refusing")]
+    BadDeviceNumber {
+        /// The partition `/dev/<kname>` path.
+        dev: String,
+    },
+    /// Creating the private `COS_OEM` block-device node (`mknod`) failed.
+    #[error("creating the COS_OEM device node for {dev}")]
+    MakeNode {
+        /// The partition `/dev/<kname>` path the node represents.
+        dev: String,
+        /// The mknod errno.
+        #[source]
+        source: Errno,
+    },
+    /// Mounting the `COS_OEM` partition failed.
+    #[error("mounting COS_OEM device {dev}")]
+    Mount {
+        /// The partition `/dev/<kname>` path.
+        dev: String,
+        /// The mount errno.
+        #[source]
+        source: Errno,
+    },
+    /// Writing or flushing the per-host `99_beskar7.yaml` failed. The source is an
+    /// I/O error only — it never contains the config contents (the join secret).
+    #[error("writing the per-host COS_OEM config")]
+    ConfigWrite(#[source] std::io::Error),
+    /// Unmounting `COS_OEM` failed.
+    #[error("unmounting COS_OEM at {path}")]
+    Unmount {
+        /// The mountpoint path.
+        path: String,
+        /// The umount errno.
+        #[source]
+        source: Errno,
+    },
+    /// The `reboot(2)` syscall itself failed (it does not return on success).
+    #[error("reboot syscall failed")]
+    Reboot(#[source] Errno),
 }
 
 /// Stream `image_url` onto `target`, verifying it against `target_digest`, and
@@ -135,7 +235,7 @@ pub fn write_image(
             path: path.clone(),
             source,
         })?;
-    verify_target_identity(&file, target)?;
+    verify_node_identity(&file, &path, &target.dev_number)?;
 
     let fetcher = ImageFetcher::new()?;
     let written = fetcher.fetch_to(image_url, &digest, cap, &mut file)?;
@@ -155,27 +255,31 @@ fn effective_max_bytes(build_max: u64, disk_capacity: u64) -> u64 {
     }
 }
 
-/// Confirm the opened `file` is the block device selected: it must be a block
-/// device, and its `st_rdev` must equal `target.dev_number` (the `major:minor`
-/// recorded at selection). Refuses on any mismatch or when no device number was
-/// recorded (§5 TOCTOU guard).
-fn verify_target_identity(file: &File, target: &TargetDisk) -> Result<(), DeployError> {
-    let path = target.dev_path();
-    if target.dev_number.is_empty() {
-        return Err(DeployError::NoDeviceNumber { path });
+/// Confirm the opened `file` is the intended block device: it must be a block
+/// device, and its `st_rdev` must equal `expected_dev` (the `major:minor` recorded
+/// at selection/enumeration). Refuses on any mismatch or when no device number was
+/// recorded (§5 / §9.1 5.3 TOCTOU guard). Shared by the whole-disk write and the
+/// `COS_OEM` partition mount.
+fn verify_node_identity(file: &File, path: &str, expected_dev: &str) -> Result<(), DeployError> {
+    if expected_dev.is_empty() {
+        return Err(DeployError::NoDeviceNumber {
+            path: path.to_string(),
+        });
     }
     let meta = file.metadata().map_err(|source| DeployError::Stat {
-        path: path.clone(),
+        path: path.to_string(),
         source,
     })?;
     if !meta.file_type().is_block_device() {
-        return Err(DeployError::NotABlockDevice { path });
+        return Err(DeployError::NotABlockDevice {
+            path: path.to_string(),
+        });
     }
-    match rdev_matches(meta.rdev(), &target.dev_number) {
+    match rdev_matches(meta.rdev(), expected_dev) {
         Ok(()) => Ok(()),
         Err(found) => Err(DeployError::DeviceIdentityMismatch {
-            path,
-            expected: target.dev_number.clone(),
+            path: path.to_string(),
+            expected: expected_dev.to_string(),
             found,
         }),
     }
@@ -194,6 +298,175 @@ fn rdev_matches(rdev: u64, expected: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(found)
+    }
+}
+
+/// Re-read `target`'s partition table (`BLKRRPART`) so the freshly-written image's
+/// partitions appear in `/sys` and `/dev` (contract §9.1 5.3). Re-opens the
+/// whole-disk node and re-verifies its identity (§5) before the ioctl.
+pub fn reread_partition_table(target: &TargetDisk) -> Result<(), DeployError> {
+    let path = target.dev_path();
+    let file = OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map_err(|source| DeployError::OpenTarget {
+            path: path.clone(),
+            source,
+        })?;
+    verify_node_identity(&file, &path, &target.dev_number)?;
+    // SAFETY: `file` is an open block-device fd; BLKRRPART takes no argument and
+    // only asks the kernel to re-scan that device's partition table.
+    unsafe { blkrrpart(file.as_raw_fd()) }.map_err(|source| DeployError::Reread {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Mount the located `COS_OEM` partition, write the per-host Kairos cloud-config
+/// (`99_beskar7.yaml`, carrying `user_data` — the CAPI join secret) into it, and
+/// unmount (contract §9.1 5.3–5.5).
+///
+/// The mount is bound to the partition's **enumerated `major:minor`** (finding
+/// H1 / §9.1 5.3 parentage check): rather than mounting a `/dev/<kname>` path that
+/// could be repointed between enumeration and mount, this `mknod`s a private block
+/// node from `oem.dev_number` and mounts *that* — so the device mounted is provably
+/// the partition [`crate::oem`] enumerated on the target disk. `COS_OEM` is
+/// **always unmounted before returning** — on success or failure — with the partial
+/// config removed first on failure (finding H2).
+///
+/// `user_data` is the join secret: it is written only to the `0600`/root file and
+/// is never logged. The caller zeroes its buffer after this returns.
+pub fn inject_oem_config(oem: &OemPartition, user_data: &[u8]) -> Result<(), DeployError> {
+    let dev = oem.dev_path();
+    let devnum = parse_dev_number(&oem.dev_number)
+        .ok_or_else(|| DeployError::BadDeviceNumber { dev: dev.clone() })?;
+
+    // Bind to the kernel partition by its verified major:minor: create a private
+    // block node from the enumerated devnum and mount THAT — no /dev path to
+    // repoint (§9.1 5.3). `/run` is a fresh tmpfs the PID-1 inspector solely owns;
+    // the remove_file clears any stale node from a prior attempt, and mknod(2) does
+    // NOT follow a symlink at the final component (it fails EEXIST), so a planted
+    // symlink at this path cannot redirect the node — do not "harden" this into an
+    // O_NOFOLLOW open, which has different semantics that don't apply to mknod.
+    let node = Path::new(OEM_DEV_NODE);
+    let _ = fs::remove_file(node);
+    mknod(
+        node,
+        SFlag::S_IFBLK,
+        Mode::from_bits_truncate(0o600),
+        devnum,
+    )
+    .map_err(|source| DeployError::MakeNode {
+        dev: dev.clone(),
+        source,
+    })?;
+
+    let result = mount_inject_unmount(node, user_data, &dev);
+    let _ = fs::remove_file(node); // remove the private node after the mount lifetime
+    result
+}
+
+/// The mount → write → unmount core, factored out so [`inject_oem_config`] always
+/// removes the private device node afterward. Mounts `node` (`nodev,nosuid,noexec`),
+/// writes the config, and **always unmounts before returning** (finding H2).
+fn mount_inject_unmount(node: &Path, user_data: &[u8], dev: &str) -> Result<(), DeployError> {
+    let mnt = Path::new(OEM_MOUNTPOINT);
+    fs::create_dir_all(mnt).map_err(|source| DeployError::Mountpoint {
+        path: OEM_MOUNTPOINT.to_string(),
+        source,
+    })?;
+
+    // nodev,nosuid,noexec: COS_OEM holds config, never device nodes, setuid
+    // binaries, or executables (§9.1 5.3). The ext4 driver mounts ext2/3/4.
+    let flags = MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC;
+    if let Err(source) = mount(Some(node), mnt, Some("ext4"), flags, None::<&str>) {
+        let _ = fs::remove_dir(mnt);
+        return Err(DeployError::Mount {
+            dev: dev.to_string(),
+            source,
+        });
+    }
+
+    // Write the config. On failure, remove the partial file (it may hold the join
+    // secret) BEFORE unmounting (finding H2).
+    let inject = write_and_sync_config(mnt, user_data);
+    if inject.is_err() {
+        let _ = fs::remove_file(mnt.join(OEM_CONFIG_FILENAME));
+    }
+
+    // Always unmount before returning — COS_OEM is never left mounted across a
+    // reboot or a drop to a debug shell (§9.1 5.4, finding H2). If the eager
+    // unmount fails (e.g. EBUSY), fall back to a lazy MNT_DETACH so the mount is
+    // still torn down before we return — the "detached before return" invariant is
+    // unconditional. The original (eager) error is still surfaced to the caller.
+    let unmount = match umount2(mnt, MntFlags::empty()) {
+        Ok(()) => Ok(()),
+        Err(eager) => {
+            let _ = umount2(mnt, MntFlags::MNT_DETACH);
+            Err(DeployError::Unmount {
+                path: OEM_MOUNTPOINT.to_string(),
+                source: eager,
+            })
+        }
+    };
+    let _ = fs::remove_dir(mnt); // best-effort tidy of the (now-empty) mountpoint
+
+    // Surface the inject failure first (more informative), then any unmount failure.
+    inject?;
+    unmount?;
+    Ok(())
+}
+
+/// Parse a `"major:minor"` string (as `/sys/block/.../dev` renders it) into a
+/// `dev_t`, so the mount can be bound to the enumerated device number. Both parts
+/// must be decimal integers; `None` otherwise (including an empty string).
+fn parse_dev_number(s: &str) -> Option<nix::libc::dev_t> {
+    let (major, minor) = s.split_once(':')?;
+    let major: u64 = major.parse().ok()?;
+    let minor: u64 = minor.parse().ok()?;
+    Some(makedev(major, minor))
+}
+
+/// Write `contents` to `<mount_dir>/99_beskar7.yaml`, force mode `0600`, and
+/// `fsync` both the file and its directory so the config is durable before the
+/// unmount/reboot (contract §9.1 5.3–5.4). The file content is `user_data`
+/// verbatim — v2 *places* a Kairos-compatible cloud-config, it does not transcode
+/// (§9.1 5.3). Pure file I/O over an injected directory, so it is unit-tested
+/// against a scratch dir without a real mount.
+fn write_and_sync_config(mount_dir: &Path, contents: &[u8]) -> Result<(), DeployError> {
+    let path = mount_dir.join(OEM_CONFIG_FILENAME);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(DeployError::ConfigWrite)?;
+    // Force exactly 0600 regardless of the inherited umask — the file holds the
+    // join secret and must never be group/other-readable.
+    file.set_permissions(Permissions::from_mode(0o600))
+        .map_err(DeployError::ConfigWrite)?;
+    file.write_all(contents).map_err(DeployError::ConfigWrite)?;
+    file.sync_all().map_err(DeployError::ConfigWrite)?;
+    // fsync the directory so the new dirent survives the unmount/reboot.
+    let dir = File::open(mount_dir).map_err(DeployError::ConfigWrite)?;
+    dir.sync_all().map_err(DeployError::ConfigWrite)?;
+    Ok(())
+}
+
+/// `sync(2)` then `reboot(2)` into the provisioned OS (contract §9.1 5.4). Does
+/// **not** return on success (the host reboots); the returned [`DeployError`] is
+/// reachable only if the syscall fails. The caller MUST have unmounted `COS_OEM`
+/// (via [`inject_oem_config`]) and zeroed the `user_data` buffer first.
+pub fn reboot_now() -> DeployError {
+    // Belt-and-suspenders: the COS_OEM unmount and the image write's sync_all
+    // already made everything durable, but a final sync costs nothing.
+    nix::unistd::sync();
+    match reboot(RebootMode::RB_AUTOBOOT) {
+        // RB_AUTOBOOT diverges on success, so Ok is unreachable.
+        Ok(infallible) => match infallible {},
+        Err(source) => DeployError::Reboot(source),
     }
 }
 
@@ -247,18 +520,11 @@ mod tests {
     #[test]
     fn no_device_number_refuses_identity() {
         // An empty dev_number means selection could not read /sys/block/<k>/dev;
-        // verify_target_identity must refuse before any write. We exercise the
-        // pre-metadata guard directly via a TargetDisk with no dev_number by
-        // checking the rdev helper is never the thing that passes it.
-        let target = TargetDisk {
-            kname: "nvme0n1".into(),
-            size_bytes: 480 * 1_000_000_000,
-            dev_number: String::new(),
-        };
-        // Open /dev/null as a stand-in File; the empty-dev_number guard fires
-        // before metadata is inspected, so the node's nature is irrelevant.
+        // verify_node_identity must refuse before any write. The empty-dev_number
+        // guard fires before metadata is inspected, so the node's nature is
+        // irrelevant — /dev/null is just a stand-in open File.
         let f = File::open("/dev/null").expect("/dev/null opens");
-        let err = verify_target_identity(&f, &target).unwrap_err();
+        let err = verify_node_identity(&f, "/dev/nvme0n1", "").unwrap_err();
         assert!(
             matches!(err, DeployError::NoDeviceNumber { .. }),
             "got {err:?}"
@@ -267,15 +533,10 @@ mod tests {
 
     #[test]
     fn non_block_device_is_refused() {
-        // /dev/null is a *character* device: identity verification must reject it
-        // as not-a-block-device rather than write to it.
-        let target = TargetDisk {
-            kname: "null".into(),
-            size_bytes: 0,
-            dev_number: "1:3".into(), // /dev/null is char 1:3, but it's not a block dev
-        };
+        // /dev/null is a *character* device (1:3): identity verification must
+        // reject it as not-a-block-device rather than write to it.
         let f = File::open("/dev/null").expect("/dev/null opens");
-        let err = verify_target_identity(&f, &target).unwrap_err();
+        let err = verify_node_identity(&f, "/dev/null", "1:3").unwrap_err();
         assert!(
             matches!(err, DeployError::NotABlockDevice { .. }),
             "got {err:?}"
@@ -296,5 +557,59 @@ mod tests {
             matches!(err, DeployError::Image(ImageError::InvalidDigestFormat)),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn write_and_sync_config_writes_0600_with_exact_contents() {
+        let s = crate::probe::testutil::Scratch::new("oem-cfg");
+        let user_data = b"#cloud-config\nstages:\n  boot:\n    - name: join\n";
+        write_and_sync_config(s.path(), user_data).expect("config written");
+
+        let path = s.path().join(OEM_CONFIG_FILENAME);
+        let meta = std::fs::metadata(&path).expect("file exists");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "the join-secret config must be 0600"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            user_data,
+            "contents verbatim"
+        );
+    }
+
+    #[test]
+    fn write_and_sync_config_truncates_a_previous_file() {
+        // A retry must not leave stale trailing bytes from a longer prior write.
+        let s = crate::probe::testutil::Scratch::new("oem-cfg-trunc");
+        write_and_sync_config(s.path(), b"a much longer previous config body").unwrap();
+        write_and_sync_config(s.path(), b"short").unwrap();
+        let path = s.path().join(OEM_CONFIG_FILENAME);
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
+    }
+
+    #[test]
+    fn config_filename_is_the_contract_numbered_name() {
+        // The 99_ prefix orders it after the image's baked-in OEM configs (§9.1 5.3).
+        assert_eq!(OEM_CONFIG_FILENAME, "99_beskar7.yaml");
+    }
+
+    #[test]
+    fn parse_dev_number_round_trips_through_makedev() {
+        // The parsed major:minor must reconstruct the same dev_t the kernel uses,
+        // so the mknod'd node binds to exactly the enumerated partition.
+        assert_eq!(
+            parse_dev_number("259:3"),
+            Some(nix::sys::stat::makedev(259, 3))
+        );
+        assert_eq!(parse_dev_number("8:0"), Some(nix::sys::stat::makedev(8, 0)));
+    }
+
+    #[test]
+    fn parse_dev_number_rejects_malformed_input() {
+        for bad in ["", "259", "259:", ":3", "a:b", "259:3:1", "8 0"] {
+            assert_eq!(parse_dev_number(bad), None, "{bad:?} should not parse");
+        }
     }
 }
