@@ -1,0 +1,60 @@
+# cargo-deny configuration for beskar7-inspector.
+#
+# The inspector ships as a static musl binary used directly as the initramfs
+# /init (PID 1) on bare-metal hosts during provisioning. Its dependency closure
+# is part of the boot-time trust surface: a vulnerable, unmaintained, or
+# surprising-licensed crate here runs as PID 1 with full hardware access. This
+# gate fails CI on known advisories, yanked crates, disallowed licenses, and
+# any non-crates.io source.
+#
+# Validated locally with cargo-deny 0.19.8; CI pins cargo-deny via the same
+# tooling. Run locally with: cargo deny check
+
+[graph]
+# The artifact is built only for x86_64-unknown-linux-musl. Restricting the
+# dependency graph to that target keeps the checks focused on the crates that
+# actually ship in the boot image (no Windows/macOS-only transitive deps).
+targets = [
+    { triple = "x86_64-unknown-linux-musl" },
+]
+all-features = true
+
+[advisories]
+# RustSec advisory database. In cargo-deny's current schema every vulnerability,
+# unsound, and unmaintained advisory fails the build; a yanked crate also fails.
+# Any advisory we consciously accept must be listed in `ignore` with a rationale
+# and a link — an empty list is the desired steady state.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive-only. The full closure was enumerated and every crate resolves to
+# one of these SPDX identifiers; there is no copyleft (GPL/AGPL/LGPL) or weak
+# copyleft (MPL) in the tree. A new license class entering the boot image must
+# be reviewed and added here deliberately.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Keep the binary lean and the trust surface small. The closure currently has no
+# duplicate versions; `deny` enforces that — in particular it fails CI if a change
+# splits the deliberately-unified rustls/ring (the Cargo.toml goes to lengths to
+# keep a single rustls + single ring). Wildcard version requirements are denied:
+# a boot-image dependency must be pinned to a range.
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+# crates.io only. No git or alternate-registry dependency may enter the boot
+# image without an explicit, reviewed allowlist entry here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

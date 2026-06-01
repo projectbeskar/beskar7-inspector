@@ -1,0 +1,45 @@
+name: supply-chain
+
+# cargo-deny gates the dependency closure that ships in the initramfs /init.
+# Runs on every push/PR, and weekly on a schedule so a newly-published RustSec
+# advisory against an unchanged Cargo.lock is caught even with no code change.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin cargo-deny and verify the downloaded prebuilt against its known SHA-256,
+  # so this security gate does not itself pull an unpinned third-party action.
+  CARGO_DENY_VERSION: "0.19.8"
+  CARGO_DENY_SHA256: "70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f"
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories / bans / licenses / sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny (pinned, checksum-verified prebuilt)
+        run: |
+          set -euo pipefail
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL "$url" -o cargo-deny.tar.gz
+          echo "${CARGO_DENY_SHA256}  cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf cargo-deny.tar.gz --strip-components=1
+          install -m 0755 cargo-deny /usr/local/bin/cargo-deny
+          rm -f cargo-deny.tar.gz
+          cargo-deny --version
+
+      - name: cargo-deny check
+        # --locked: fail if Cargo.lock is stale, so the audited graph is exactly
+        # the graph that ships (no silent re-resolution to a different closure).
+        run: cargo-deny --locked check --show-stats
