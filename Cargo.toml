@@ -27,6 +27,7 @@ path = "src/main.rs"
 #   mount  — mount(2)/umount2(2) for the COS_OEM partition (nodev,nosuid,noexec)
 #   reboot — reboot(2) into the provisioned OS (§9.1 5.4)
 #   ioctl  — the BLKRRPART ioctl that re-reads the freshly-written partition table
+#   mman   — mlockall(2) at PID-1 start so the in-RAM secrets never swap (§9)
 # Pinned to the 0.29 line, whose MSRV (1.69) stays within this crate's declared
 # rust-version. Safe wrappers are preferred over hand-rolled FFI in a memory-safe
 # binary.
@@ -36,6 +37,7 @@ nix = { version = "0.29", default-features = false, features = [
     "mount",
     "reboot",
     "ioctl",
+    "mman",
 ] }
 serde = { version = "1.0", features = ["derive"] }
 # Serialize the InspectionReport into the POST body for the callback client
@@ -72,6 +74,12 @@ rustls-pemfile = "2"
 sha2 = "0.10"
 # Decode the base64-encoded `beskar7.ca` PEM string from the cmdline (§5/§8).
 base64 = "0.22"
+# Volatile, non-elidable zeroing of the in-RAM secrets — the bearer token and the
+# fetched CAPI bootstrap user-data (the join secret) — after use, so they do not
+# linger in freed heap (contract §9: the ramdisk runs swapless and the inspector
+# zeroes these buffers). A plain loop can be optimized away; `zeroize` guarantees
+# the writes happen. Pure-Rust, no C toolchain.
+zeroize = "1"
 
 [profile.release]
 # The shipped artifact is an initramfs binary: optimize for size and strip.

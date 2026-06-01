@@ -8,11 +8,22 @@
 
 use std::fmt;
 
+use zeroize::Zeroize;
+
 /// A secret string that never reveals its contents via `Debug`. It deliberately
 /// implements neither `Display` nor `PartialEq`, to prevent accidental logging
 /// and non-constant-time comparison. Read the value only via [`Secret::expose`].
+///
+/// The inner value is zeroed on drop (contract §9: the bearer token must not
+/// linger in freed memory), via [`Zeroize`].
 #[derive(Clone)]
 pub struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl Secret {
     pub fn new(value: impl Into<String>) -> Self {
