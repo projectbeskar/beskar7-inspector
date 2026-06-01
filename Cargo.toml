@@ -9,7 +9,7 @@ repository = "https://github.com/projectbeskar/beskar7-inspector"
 publish = false
 
 # The crate ships as a static binary used directly as the initramfs /init, but
-# is split lib + thin bin so the contract types, probes, client, and kexec
+# is split lib + thin bin so the contract types, probes, client, and deploy
 # modules are unit- and contract-testable.
 [lib]
 name = "beskar7_inspector"

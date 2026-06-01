@@ -1,361 +1,91 @@
-# Beskar7-Inspector
+# beskar7-inspector
 
-**Alpine Linux-based hardware inspection image for Beskar7 bare-metal provisioning**
+The hardware-inspection and provisioning ramdisk for
+[Beskar7](https://github.com/projectbeskar/beskar7), a Cluster API infrastructure
+provider for bare-metal hosts.
 
-## Overview
+The inspector is a single **static Rust binary** (`x86_64-unknown-linux-musl`)
+used directly as the initramfs `/init`. It PXE-boots on a target machine, probes
+its hardware natively, reports to the Beskar7 controller, then writes the target
+OS image to disk and reboots into it. There is no shell, no busybox, and no
+external tools — every probe and provisioning syscall is performed in-process.
 
-Beskar7-Inspector is a lightweight, bootable Alpine Linux image that boots via iPXE, inspects bare-metal server hardware, reports back to Beskar7, and then kexecs into the final operating system.
+## How it works (contract v2)
 
-## Features
+Beskar7 renders a per-host iPXE script that boots this image with the `beskar7.*`
+parameters on the kernel cmdline. The inspector then runs two phases:
 
-- 🔍 **Hardware Detection** - CPU, memory, disks, NICs
-- 📊 **Detailed Reporting** - Structured JSON reports to Beskar7 API
-- 🚀 **Fast Boot** - < 60 seconds from power-on to report
-- 🔄 **Kexec Support** - Seamless transition to target OS
-- 🛡️ **Vendor Agnostic** - Works on any x86_64 server
-- 📦 **Minimal Size** - ~100MB compressed
-
-## Architecture
+1. **Enroll & inspect** (always) — parse the cmdline, probe hardware from
+   firmware truth (SMBIOS/DMI via `/sys/firmware/dmi/tables`, plus `/sys` and
+   `/proc`), select a target disk, and `POST` the report to the controller over
+   verified TLS (success is `202 Accepted`). `--dry-run` stops here.
+2. **Provision** (when bootstrap data is ready) — `GET` the CAPI bootstrap
+   user-data, stream the digest-pinned whole-disk OS image (a Kairos raw image)
+   onto the selected disk while verifying its SHA-256, inject a per-host
+   cloud-config (carrying the join secret) into the image's `COS_OEM` partition,
+   and `reboot(2)` into the provisioned OS.
 
 ```
-Power On → PXE Boot → iPXE → Inspector Image → Inspect → Report → Kexec → Target OS
-                         ↓                          ↓          ↓
-                    boot.ipxe              Hardware Data   Beskar7 API
+power on → PXE → controller-rendered iPXE → inspector
+              Phase 1: probe → POST report (202)
+              Phase 2: GET bootstrap → write image (digest-verified)
+                       → inject COS_OEM config → reboot → target OS
 ```
 
-## Quick Start
+The wire contract — endpoints, cmdline parameters, the report schema, the
+digest-pinning trust model, and the disk/`COS_OEM` behavior — is specified in
+[`docs/inspector-contract.md`](https://github.com/projectbeskar/beskar7/blob/main/docs/inspector-contract.md)
+in the beskar7 repo (the **source of truth**). This repo implements contract
+**v2** (`CONTRACT_VERSION` in `src/lib.rs`).
 
-### Prerequisites
+## Security posture
 
-- Docker or Podman
-- Boot server with iPXE support
-- Beskar7 controller running
+- **Verified TLS** to the callback (rustls, CA delivered on the cmdline); no
+  insecure-skip-verify on the report/bootstrap path.
+- The **target image is integrity-checked by content digest**, not TLS — it may
+  be served over plain HTTP and is gated by `beskar7.target-digest`; the inspector
+  never boots a non-matching image.
+- The **join secret** is written only to a `0600`/root file on the verified
+  `COS_OEM` partition, held in zeroizing buffers, and pinned out of swap with
+  `mlockall`. The bearer token, boot nonce, full cmdline, and user-data are never
+  logged.
+- Device identity is re-verified (`st_rdev`) before every destructive write, so a
+  repointed `/dev` node cannot redirect the image or the join secret.
 
-### Build
+## Build, test, lint
 
 ```bash
-# Clone repository
-git clone https://github.com/projectbeskar/beskar7-inspector.git
-cd beskar7-inspector
-
-# Build inspection image
-make build
-
-# Output: build/vmlinuz and build/initrd.img
+cargo test --all-targets                       # unit + contract tests
+cargo fmt --all -- --check                     # formatting (CI-enforced)
+cargo clippy --all-targets -- -D warnings      # lint (CI-enforced)
+make check                                     # all three of the above
+make image                                     # build build/vmlinuz + build/initrd.img
+make test-vm                                   # boot the image in QEMU (Phase 1 smoke)
 ```
 
-### Deploy
+`make image` produces the two boot files (`build/vmlinuz`, `build/initrd.img`)
+from the multi-stage `Dockerfile`: it builds the static binary, assembles a
+minimal initramfs (the binary as `/init` plus the mountpoints it needs), and
+takes the kernel from Alpine's `linux-lts`. An operator serves these two files to
+the boot infrastructure the controller's iPXE script points at.
 
-```bash
-# Copy to boot server
-make deploy BOOT_SERVER=boot.example.com BOOT_PATH=/var/www/boot/inspector/
+> **Status:** the inspector is feature-complete against contract v2 and fully unit-
+> and contract-tested. End-to-end boot on real firmware (PXE → inspect → provision
+> → reboot) is validated as part of Beskar7's integration/e2e work, not in this
+> repo's CI (which runs fmt, clippy, and tests).
 
-# Or manually:
-scp build/vmlinuz boot-server:/var/www/boot/inspector/
-scp build/initrd.img boot-server:/var/www/boot/inspector/
-```
-
-### iPXE Boot Script
-
-Create `/var/www/boot/ipxe/inspect.ipxe`:
-
-```ipxe
-#!ipxe
-
-echo Booting Beskar7 Inspector...
-
-# Set API endpoint
-set beskar7-api http://beskar7-inspection.beskar7-system.svc.cluster.local:8082
-
-# Get host info from DHCP or set manually
-set beskar7-namespace ${beskar7-namespace:default}
-set beskar7-host ${beskar7-host:unknown}
-
-# Boot inspection kernel
-kernel http://boot-server/inspector/vmlinuz \
-    beskar7.api=${beskar7-api} \
-    beskar7.namespace=${beskar7-namespace} \
-    beskar7.host=${beskar7-host} \
-    console=tty0 \
-    console=ttyS0,115200
-
-initrd http://boot-server/inspector/initrd.img
-
-boot
-```
-
-## How It Works
-
-### 1. Boot Phase
-- Server PXE boots
-- iPXE chainloads boot script
-- Kernel and initrd downloaded
-- Boot with beskar7.* parameters
-
-### 2. Inspection Phase
-- Alpine Linux boots in RAM
-- Detection scripts execute:
-  - CPU: cores, model, frequency
-  - Memory: capacity, speed, type
-  - Disks: size, type, model
-  - NICs: MAC, speed, driver
-  - System: manufacturer, model, serial
-
-### 3. Reporting Phase
-- Generate JSON report
-- POST to Beskar7 API endpoint
-- Retry on failure (3 attempts)
-- Wait for acknowledgment
-
-### 4. Provisioning Phase
-- Receive target OS URL from Beskar7
-- Download kernel + initrd
-- Verify checksums
-- Kexec into target OS
-
-## Configuration
-
-### Kernel Parameters
-
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| `beskar7.api` | Beskar7 API endpoint | `http://beskar7.local:8082` |
-| `beskar7.namespace` | Kubernetes namespace | `default` |
-| `beskar7.host` | PhysicalHost name | `server-01` |
-| `beskar7.timeout` | Inspection timeout (seconds) | `600` |
-| `beskar7.debug` | Enable debug output | `true` |
-
-### Environment Variables
-
-Set in `/config/inspector.conf`:
-
-```bash
-# Retry configuration
-RETRY_COUNT=3
-RETRY_DELAY=5
-
-# Timeout configuration
-INSPECTION_TIMEOUT=300
-DOWNLOAD_TIMEOUT=600
-
-# Debug mode
-DEBUG=false
-```
-
-## Development
-
-### Project Structure
+## Layout
 
 ```
-beskar7-inspector/
-├── Dockerfile               # Alpine image builder
-├── Makefile                 # Build automation
-├── scripts/                 # Inspection scripts
-│   ├── 00-init.sh          # Initialize environment
-│   ├── 01-hardware-inspect.sh  # Hardware detection
-│   ├── 02-network-setup.sh     # Network setup
-│   ├── 03-report-to-beskar7.sh # Report submission
-│   ├── 04-download-os.sh       # OS download
-│   ├── 05-kexec-boot.sh        # Kexec boot
-│   └── utils.sh                # Utilities
-├── config/                  # Configuration
-├── templates/               # JSON templates
-└── tests/                   # Test scripts
+src/cmdline.rs      parse /proc/cmdline into the beskar7.* params
+src/probe/          native hardware probing (SMBIOS/DMI + /sys + /proc)
+src/report.rs       serde structs that serialize to the contract report schema
+src/client.rs       rustls callback client: POST report (202), GET bootstrap
+src/image.rs        digest-pinned streaming target-image fetch
+src/target_disk.rs  target-disk selection
+src/oem.rs          locate the COS_OEM partition on the target disk
+src/deploy.rs       whole-disk write + COS_OEM mount/inject + reboot
+src/run.rs          the PID-1 two-phase pipeline
+src/main.rs         thin PID-1 entrypoint over run::run
+tests/contract.rs   golden-fixture report round-trip (shared with beskar7)
 ```
-
-### Building Locally
-
-```bash
-# Build image
-make build
-
-# Test in QEMU
-make test-vm
-
-# Run tests
-make test
-
-# Clean build artifacts
-make clean
-```
-
-### Testing
-
-```bash
-# Unit tests
-make test-unit
-
-# Integration test in VM
-make test-integration
-
-# Test on real hardware
-make test-hardware HARDWARE=192.168.1.100
-```
-
-## API Integration
-
-### Inspection Report Format
-
-The inspector POSTs this JSON to Beskar7:
-
-```json
-{
-  "namespace": "default",
-  "hostName": "server-01",
-  "manufacturer": "Dell Inc.",
-  "model": "PowerEdge R750",
-  "serialNumber": "ABC123",
-  "cpus": [
-    {
-      "id": "0",
-      "vendor": "Intel",
-      "model": "Xeon Gold 6254",
-      "cores": 18,
-      "threads": 36,
-      "frequency": "3.1GHz"
-    }
-  ],
-  "memory": [
-    {
-      "id": "DIMM0",
-      "type": "DDR4",
-      "capacity": "32GB",
-      "speed": "3200MHz"
-    }
-  ],
-  "disks": [
-    {
-      "name": "/dev/sda",
-      "model": "Samsung 870 EVO",
-      "sizeGB": 500,
-      "type": "SSD",
-      "serialNumber": "S5H1NS0T123456"
-    }
-  ],
-  "nics": [
-    {
-      "name": "eth0",
-      "macAddress": "00:25:90:f0:79:00",
-      "driver": "ixgbe",
-      "speed": "1Gbps",
-      "ipAddresses": ["192.168.1.100"]
-    }
-  ],
-  "bootModeDetected": "UEFI",
-  "firmwareVersion": "2.15.0"
-}
-```
-
-### Response
-
-```json
-{
-  "status": "success",
-  "message": "Inspection report received",
-  "targetOS": "http://images.example.com/kairos-v2.8.1.tar.gz"
-}
-```
-
-## Troubleshooting
-
-### Inspector doesn't boot
-
-**Check:**
-1. iPXE boot script syntax
-2. HTTP server accessibility
-3. Kernel parameters passed correctly
-4. Serial console output
-
-**Debug:**
-```bash
-# Enable debug mode in boot script
-kernel ... beskar7.debug=true
-```
-
-### Can't reach Beskar7 API
-
-**Check:**
-1. Network connectivity
-2. DNS resolution
-3. Firewall rules
-4. API endpoint URL
-
-**Debug:**
-```bash
-# From inspector (if you can get shell):
-curl -v http://beskar7-api:8082/healthz
-```
-
-### Hardware detection incomplete
-
-**Check:**
-1. Required tools installed (dmidecode, lshw, etc.)
-2. Permissions (some tools need root)
-3. Hardware compatibility
-
-**Debug:**
-```bash
-# Manual detection test:
-dmidecode -t system
-lscpu -J
-lsblk -J
-```
-
-## Performance
-
-| Metric | Target | Typical |
-|--------|--------|---------|
-| Boot time | < 30s | 15-20s |
-| Inspection time | < 30s | 10-15s |
-| Report time | < 5s | 2-3s |
-| **Total** | **< 60s** | **30-40s** |
-
-## Hardware Compatibility
-
-Tested on:
-- ✅ Dell PowerEdge (iDRAC)
-- ✅ HPE ProLiant (iLO)
-- ✅ Lenovo ThinkSystem (XCC)
-- ✅ Supermicro (BMC)
-- ✅ Whitebox x86_64 servers
-
-Requirements:
-- x86_64 CPU
-- 2GB+ RAM
-- Network interface
-- PXE/UEFI boot support
-
-## Contributing
-
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
-## License
-
-Apache License 2.0
-
-## Support
-
-- **Issues:** https://github.com/projectbeskar/beskar7-inspector/issues
-- **Docs:** https://github.com/wrkode/beskar7
-- **Beskar7 Repo:** https://github.com/wrkode/beskar7
-
-## Acknowledgments
-
-Built for Beskar7, inspired by:
-- Tinkerbell (tinkerbell.org)
-- Flatcar Linux ignition
-- Metal³ (metal3.io)
-
----
-
-**Status:** Production Ready  
-**Version:** 1.0  
-**Size:** ~100MB  
-**Boot Time:** ~30-40 seconds
-
