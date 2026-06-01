@@ -102,6 +102,11 @@ pub enum RunError {
 pub fn run(dry_run: bool) -> Result<(), RunError> {
     if !dry_run {
         mount_pseudo_filesystems()?;
+        // Load the curated storage/network/fs drivers so /sys/block and
+        // /sys/class/net are populated before probing, and ext4 is available for
+        // the COS_OEM mount (D-012). Best-effort; must run after /proc,/sys,/dev
+        // are mounted and before the probe reads /sys.
+        crate::modules::load_drivers();
         // Pin all current and future pages so the in-RAM secrets (token,
         // user-data) can never be paged to swap — making §9's swapless guarantee
         // a runtime invariant rather than a deployment assumption. Best-effort: a

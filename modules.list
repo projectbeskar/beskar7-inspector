@@ -1,0 +1,26 @@
+# Curated kernel modules the inspector loads at startup (decision D-012).
+#
+# These are *base* module names; the Dockerfile resolves transitive dependencies
+# and load order at build time (depmod / `modprobe --show-depends`) and ships the
+# result, uncompressed, plus an ordered `beskar7.load` the binary finit_module's.
+# Built-in drivers (already in the kernel) are skipped at build time.
+#
+# This is the Smoke 0/1 slice: virtio (QEMU/KVM) + ahci/e1000 (legacy QEMU) +
+# ext4 (mandatory — the COS_OEM partition the inspector mounts is ext). The broad
+# bare-metal NIC/HBA set + a PCI-modalias coldplug pass are a deliberate
+# follow-up (see D-012); they are not needed for the QEMU smoke loop.
+
+# Storage + bus (virtio for QEMU/KVM)
+virtio_pci
+virtio_blk
+virtio_scsi
+
+# Storage (legacy/QEMU + common bare metal)
+ahci
+
+# Networking (QEMU)
+virtio_net
+e1000
+
+# Filesystem — mandatory: COS_OEM (and the deploy mount) is ext2/3/4
+ext4
