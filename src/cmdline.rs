@@ -55,6 +55,13 @@ pub struct BootParams {
     /// and eligibility are `target_disk`'s responsibility (contract §5 / §9.1
     /// step 2). Non-secret.
     pub disk: Option<String>,
+    /// `BOOTIF` — the provisioning NIC's MAC, in the pxelinux/iPXE
+    /// `01-aa-bb-cc-dd-ee-ff` form (a `01` hardware-type prefix + the MAC of the
+    /// interface that PXE-booted). Used by [`crate::net`] to pick which NIC to
+    /// DHCP-configure (contract §networking). NOT a `beskar7.*` key — it is the
+    /// established netboot convention. Non-secret; `None` if absent (then `net`
+    /// falls back to the single physical NIC).
+    pub bootif: Option<String>,
     /// `beskar7.timeout` — optional inspector-side overall timeout.
     pub timeout: Option<Duration>,
     /// `beskar7.debug` — verbose logging / debug shell on failure.
@@ -97,6 +104,7 @@ impl BootParams {
         let mut target_digest = None;
         let mut ca = None;
         let mut disk = None;
+        let mut bootif = None;
         let mut timeout = None;
         let mut debug = false;
 
@@ -115,6 +123,8 @@ impl BootParams {
                 "beskar7.target-digest" => target_digest = non_empty(value),
                 "beskar7.ca" => ca = non_empty(value),
                 "beskar7.disk" => disk = non_empty(value),
+                // The pxelinux/iPXE netboot convention (not a beskar7.* key).
+                "BOOTIF" => bootif = non_empty(value),
                 "beskar7.timeout" => {
                     if !value.is_empty() {
                         let secs: u64 = value.parse().map_err(|_| CmdlineError::InvalidTimeout)?;
@@ -154,6 +164,7 @@ impl BootParams {
             target_digest: target_digest.expect("target_digest present"),
             ca: ca.expect("ca present"),
             disk,
+            bootif,
             timeout,
             debug,
         })
@@ -240,6 +251,15 @@ mod tests {
         let line = format!("{} beskar7.disk=", minimal());
         let p = BootParams::parse(&line).expect("valid");
         assert_eq!(p.disk, None);
+    }
+
+    #[test]
+    fn bootif_is_parsed_from_the_pxelinux_convention() {
+        let p = BootParams::parse(&minimal()).expect("valid");
+        assert_eq!(p.bootif, None);
+        let line = format!("{} BOOTIF=01-52-54-00-12-34-56", minimal());
+        let p = BootParams::parse(&line).expect("valid");
+        assert_eq!(p.bootif.as_deref(), Some("01-52-54-00-12-34-56"));
     }
 
     #[test]

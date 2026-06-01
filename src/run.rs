@@ -44,6 +44,7 @@ use crate::client::{CallbackClient, ClientError};
 use crate::cmdline::{BootParams, CmdlineError};
 use crate::deploy::{self, DeployError};
 use crate::image::DEFAULT_MAX_IMAGE_BYTES;
+use crate::net::{self, NetError};
 use crate::oem::{self, OemError};
 use crate::probe;
 use crate::target_disk::{self, DiskError};
@@ -72,6 +73,9 @@ pub enum RunError {
     /// Parsing the kernel cmdline failed (missing/invalid `beskar7.*`).
     #[error(transparent)]
     Cmdline(#[from] CmdlineError),
+    /// Bringing up the provisioning network (NIC select / DHCP / netlink) failed.
+    #[error(transparent)]
+    Net(#[from] NetError),
     /// Selecting the target disk failed (none eligible, or a bad `beskar7.disk`).
     #[error(transparent)]
     Disk(#[from] DiskError),
@@ -115,6 +119,18 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
     }
 
     let params = BootParams::from_proc_cmdline()?;
+
+    if !dry_run {
+        // Bring up the provisioning NIC (DHCP) so the callback is reachable — the
+        // NIC driver was loaded above, but the link is down and unaddressed, and
+        // kernel ip=dhcp can't help with a module loaded post-boot (D-013). Needs
+        // the cmdline (for BOOTIF), so it runs after the parse and before probe.
+        let net = net::bring_up_provisioning_network(&params)?;
+        eprintln!(
+            "beskar7-inspector: network up on {} ({}/{})",
+            net.iface, net.ip, net.prefix_len
+        );
+    }
 
     // ── Phase 1: enroll & inspect (always) ──────────────────────────────────
     let report = probe::collect();
