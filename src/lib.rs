@@ -12,6 +12,7 @@ pub mod probe;
 pub mod report;
 pub mod secret;
 pub mod smbios;
+pub mod target_disk;
 
 /// The controller↔inspector contract version this build implements
 /// (`docs/inspector-contract.md` in the beskar7 repo).

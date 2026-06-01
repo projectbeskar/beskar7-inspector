@@ -47,6 +47,14 @@ pub struct BootParams {
     /// TLS certificate. Kept as the raw base64 string; decoding and validation
     /// are the TLS client's responsibility (§8). Non-secret (a public CA cert).
     pub ca: String,
+    /// `beskar7.disk` — optional operator override pinning the deployment target
+    /// disk (a `/dev/...` path, a `by-id`/`by-path` symlink, or a bare kernel
+    /// name). When `None`, [`crate::target_disk::select`] auto-selects the
+    /// smallest eligible whole disk; when `Some`, that exact device is used (and
+    /// the deploy aborts rather than falling back if it is ineligible). Resolution
+    /// and eligibility are `target_disk`'s responsibility (contract §5 / §9.1
+    /// step 2). Non-secret.
+    pub disk: Option<String>,
     /// `beskar7.timeout` — optional inspector-side overall timeout.
     pub timeout: Option<Duration>,
     /// `beskar7.debug` — verbose logging / debug shell on failure.
@@ -88,6 +96,7 @@ impl BootParams {
         let mut target = None;
         let mut target_digest = None;
         let mut ca = None;
+        let mut disk = None;
         let mut timeout = None;
         let mut debug = false;
 
@@ -105,6 +114,7 @@ impl BootParams {
                 "beskar7.target" => target = non_empty(value),
                 "beskar7.target-digest" => target_digest = non_empty(value),
                 "beskar7.ca" => ca = non_empty(value),
+                "beskar7.disk" => disk = non_empty(value),
                 "beskar7.timeout" => {
                     if !value.is_empty() {
                         let secs: u64 = value.parse().map_err(|_| CmdlineError::InvalidTimeout)?;
@@ -143,6 +153,7 @@ impl BootParams {
             target: target.expect("target present"),
             target_digest: target_digest.expect("target_digest present"),
             ca: ca.expect("ca present"),
+            disk,
             timeout,
             debug,
         })
@@ -210,6 +221,25 @@ mod tests {
         let p = BootParams::parse(&minimal()).expect("valid");
         assert_eq!(p.timeout, None);
         assert!(!p.debug);
+    }
+
+    #[test]
+    fn optional_disk_is_none_when_absent_and_some_when_set() {
+        // Absent in the minimal cmdline.
+        let p = BootParams::parse(&minimal()).expect("valid");
+        assert_eq!(p.disk, None);
+
+        // Present (a by-id path) is captured verbatim; resolution is target_disk's job.
+        let pinned = format!("{} beskar7.disk=/dev/disk/by-id/nvme-FOO", minimal());
+        let p = BootParams::parse(&pinned).expect("valid");
+        assert_eq!(p.disk.as_deref(), Some("/dev/disk/by-id/nvme-FOO"));
+    }
+
+    #[test]
+    fn empty_disk_value_is_treated_as_absent() {
+        let line = format!("{} beskar7.disk=", minimal());
+        let p = BootParams::parse(&line).expect("valid");
+        assert_eq!(p.disk, None);
     }
 
     #[test]
