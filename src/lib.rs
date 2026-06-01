@@ -9,6 +9,7 @@ pub mod client;
 pub mod cmdline;
 pub mod deploy;
 pub mod image;
+pub mod oem;
 pub mod probe;
 pub mod report;
 pub mod secret;
