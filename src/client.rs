@@ -294,12 +294,14 @@ fn run_with_retries<T>(
 /// base64-encoded PEM bundle). No public roots, no insecure-skip path (§8).
 fn tls_config(ca_b64: &str) -> Result<Arc<ClientConfig>, ClientError> {
     use base64::Engine;
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
 
     let pem = base64::engine::general_purpose::STANDARD
         .decode(ca_b64.trim())
         .map_err(|_| ClientError::CaDecode)?;
-    let mut reader = std::io::BufReader::new(pem.as_slice());
-    let certs = rustls_pemfile::certs(&mut reader)
+    // PEM parsing lives in rustls-pki-types (re-exported by rustls); rustls-pemfile
+    // is unmaintained (RUSTSEC-2025-0134) and is just a thin wrapper around this.
+    let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ClientError::CaInvalid)?;
     if certs.is_empty() {

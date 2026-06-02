@@ -64,8 +64,10 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
     "logging",
 ] }
-# Parse the base64-decoded `beskar7.ca` PEM into certificates for the root store.
-rustls-pemfile = "2"
+# (The base64-decoded `beskar7.ca` PEM is parsed into certificates via the
+# PemObject API re-exported by rustls from rustls-pki-types — see src/client.rs.
+# The standalone rustls-pemfile crate was dropped: it is unmaintained, archived
+# Aug 2025, RUSTSEC-2025-0134, and was only a thin wrapper around that same code.)
 # Incrementally hash the target whole-disk image as it streams to disk, so the
 # inspector verifies it against `beskar7.target-digest` without buffering the
 # multi-GB body in RAM (contract §8.1). The digest — not TLS — is the image's
