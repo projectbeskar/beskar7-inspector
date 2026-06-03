@@ -30,11 +30,15 @@
 //! remains the deterministic pin and the recommended path; the race is the
 //! fallback for hosts whose first-stage iPXE does not supply `?mac=`.
 //!
+//! ## DNS (D-013 breadth)
+//! The DHCP option-6 servers are written to `/etc/resolv.conf`
+//! ([`write_resolv_conf`]) so a hostname `beskar7.api` resolves. An IP-literal
+//! `beskar7.api` remains the recommended form (contract §8.2) and needs no
+//! resolver, so the write is best-effort — a failure does not abort bring-up.
+//!
 //! ## Remaining scope
-//! DNS is still out of scope — `beskar7.api` is expected to be an IP-literal
-//! (contract §8). A `beskar7.ip=` static fallback, VLAN tagging, and the
-//! DHCP-option-6 → `/etc/resolv.conf` writer remain deliberate D-013 follow-ups;
-//! the single entry point is shaped so they land additively.
+//! A `beskar7.ip=` static fallback and VLAN tagging remain deliberate D-013
+//! follow-ups; the single entry point is shaped so they land additively.
 //!
 //! ## Secret hygiene (§9)
 //! No secret passes through here — DHCP is unauthenticated by design and the
@@ -68,8 +72,9 @@ pub struct NetConfig {
     pub prefix_len: u8,
     /// The default gateway (DHCP option 3), if the lease supplied one.
     pub gateway: Option<Ipv4Addr>,
-    /// DNS servers (DHCP option 6). Unused in the Smoke-1 IP-literal path;
-    /// carried for the future `/etc/resolv.conf` writer (D-013 follow-up).
+    /// DNS servers (DHCP option 6), written to `/etc/resolv.conf` by
+    /// [`write_resolv_conf`] so a hostname `beskar7.api` resolves. The recommended
+    /// IP-literal `beskar7.api` (§8.2) does not need them.
     pub dns: Vec<Ipv4Addr>,
 }
 
@@ -241,6 +246,45 @@ fn choose_lease(leases: &[Option<Lease>]) -> Option<usize> {
         .iter()
         .position(|lease| lease.as_ref().is_some_and(|l| l.gateway.is_some()))
         .or_else(|| leases.iter().position(Option::is_some))
+}
+
+/// The libc resolver (musl/glibc) reads at most three `nameserver` lines; any
+/// beyond that are silently ignored, so there is no point writing them.
+const MAX_NAMESERVERS: usize = 3;
+
+/// Render `/etc/resolv.conf` content from DHCP option-6 servers (pure;
+/// unit-tested): one `nameserver <ip>` line each, in order, de-duplicated, capped
+/// at [`MAX_NAMESERVERS`]. Empty input yields an empty string (no file written).
+fn render_resolv_conf(dns: &[Ipv4Addr]) -> String {
+    let mut chosen: Vec<Ipv4Addr> = Vec::new();
+    for ip in dns {
+        if !chosen.contains(ip) {
+            chosen.push(*ip);
+            if chosen.len() == MAX_NAMESERVERS {
+                break;
+            }
+        }
+    }
+    chosen
+        .iter()
+        .map(|ip| format!("nameserver {ip}\n"))
+        .collect()
+}
+
+/// Write the DHCP-provided DNS servers (option 6) to `/etc/resolv.conf` so a
+/// hostname `beskar7.api` resolves (D-013). A no-op when no servers were offered.
+/// Best-effort by contract: the recommended IP-literal `beskar7.api` (§8.2) needs
+/// no resolver, so the caller treats a write failure as non-fatal.
+pub fn write_resolv_conf(dns: &[Ipv4Addr]) -> std::io::Result<()> {
+    let content = render_resolv_conf(dns);
+    if content.is_empty() {
+        return Ok(());
+    }
+    // The minimal initramfs ships no `/etc`, so create it before the write —
+    // otherwise `std::fs::write` fails with ENOENT and the libc resolver, which
+    // reads `/etc/resolv.conf`, never sees a nameserver.
+    std::fs::create_dir_all("/etc")?;
+    std::fs::write("/etc/resolv.conf", content)
 }
 
 /// Select the provisioning interface(s) from `net_dir` (a `/sys/class/net`-shaped
@@ -493,5 +537,48 @@ mod tests {
         assert_eq!(mask_to_prefix_len(Ipv4Addr::new(0, 0, 0, 0)), 0);
         // Non-contiguous (pathological) falls back to /24.
         assert_eq!(mask_to_prefix_len(Ipv4Addr::new(255, 0, 255, 0)), 24);
+    }
+
+    #[test]
+    fn render_resolv_conf_empty_input_is_empty() {
+        // No option-6 servers -> empty string, so write_resolv_conf writes nothing.
+        assert_eq!(render_resolv_conf(&[]), "");
+    }
+
+    #[test]
+    fn render_resolv_conf_one_line_per_server_in_order() {
+        let dns = [Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
+        assert_eq!(
+            render_resolv_conf(&dns),
+            "nameserver 192.168.1.1\nnameserver 8.8.8.8\n"
+        );
+    }
+
+    #[test]
+    fn render_resolv_conf_dedups_preserving_first_seen_order() {
+        let dns = [
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(8, 8, 8, 8),
+        ];
+        assert_eq!(
+            render_resolv_conf(&dns),
+            "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn render_resolv_conf_caps_at_the_resolver_limit() {
+        let dns = [
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 0, 0, 3),
+            Ipv4Addr::new(10, 0, 0, 4),
+        ];
+        // Only MAX_NAMESERVERS (3) lines; the resolver ignores any beyond that.
+        assert_eq!(
+            render_resolv_conf(&dns),
+            "nameserver 10.0.0.1\nnameserver 10.0.0.2\nnameserver 10.0.0.3\n"
+        );
     }
 }
