@@ -36,9 +36,16 @@
 //! `beskar7.api` remains the recommended form (contract §8.2) and needs no
 //! resolver, so the write is best-effort — a failure does not abort bring-up.
 //!
+//! ## Static config (D-013 breadth)
+//! When `beskar7.ip` is set, the inspector skips DHCP and configures the pinned
+//! NIC (`BOOTIF` or the single interface) statically from the kernel-`ip=` subset
+//! `<ip>::<gw>:<mask>[:<dns>]` — for DHCP-less / VLAN-pinned provisioning
+//! networks. A multi-NIC host with `beskar7.ip` and no `BOOTIF` is rejected
+//! (nothing disambiguates which NIC gets the address).
+//!
 //! ## Remaining scope
-//! A `beskar7.ip=` static fallback and VLAN tagging remain deliberate D-013
-//! follow-ups; the single entry point is shaped so they land additively.
+//! VLAN tagging remains a deliberate D-013 follow-up; the single entry point is
+//! shaped so it lands additively.
 //!
 //! ## Secret hygiene (§9)
 //! No secret passes through here — DHCP is unauthenticated by design and the
@@ -78,6 +85,65 @@ pub struct NetConfig {
     pub dns: Vec<Ipv4Addr>,
 }
 
+/// A static network configuration from `beskar7.ip` (D-013), for DHCP-less /
+/// VLAN-pinned provisioning networks. Parsed from the kernel `ip=` subset
+/// `<ip>::<gw>:<mask>[:<dns>]`: client IP, an (ignored) server-IP field, an
+/// optional gateway, a netmask, and an optional DNS server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticIp {
+    /// The client address to assign.
+    pub ip: Ipv4Addr,
+    /// The default gateway, if the field was non-empty.
+    pub gateway: Option<Ipv4Addr>,
+    /// The subnet prefix length, parsed from the `<mask>` field.
+    pub prefix_len: u8,
+    /// DNS servers (zero or one in the kernel-`ip=` subset), written to
+    /// `/etc/resolv.conf` like a DHCP lease's.
+    pub dns: Vec<Ipv4Addr>,
+}
+
+impl StaticIp {
+    /// Parse the `beskar7.ip` value (kernel `ip=` subset `<ip>::<gw>:<mask>[:<dns>]`).
+    /// Returns `None` on any malformed field, an out-of-range prefix, or the wrong
+    /// number of colon-separated fields — the caller surfaces that as a loud
+    /// cmdline error rather than silently falling back to DHCP.
+    pub fn parse(value: &str) -> Option<Self> {
+        let f: Vec<&str> = value.split(':').collect();
+        // <ip> : <server> : <gw> : <mask> [: <dns>]  — 4 or 5 fields.
+        if f.len() < 4 || f.len() > 5 {
+            return None;
+        }
+        let ip: Ipv4Addr = f[0].parse().ok()?;
+        // f[1] is the kernel `ip=` server-IP field — unused here.
+        let gateway = if f[2].is_empty() {
+            None
+        } else {
+            Some(f[2].parse().ok()?)
+        };
+        let prefix_len = parse_mask(f[3])?;
+        let dns = match f.get(4) {
+            Some(d) if !d.is_empty() => vec![d.parse().ok()?],
+            _ => Vec::new(),
+        };
+        Some(StaticIp {
+            ip,
+            gateway,
+            prefix_len,
+            dns,
+        })
+    }
+}
+
+/// Parse the `<mask>` field of `beskar7.ip`: either a dotted netmask
+/// (`255.255.255.0`) or a bare CIDR prefix length (`24`).
+fn parse_mask(s: &str) -> Option<u8> {
+    if let Ok(mask) = s.parse::<Ipv4Addr>() {
+        Some(mask_to_prefix_len(mask))
+    } else {
+        s.parse::<u8>().ok().filter(|&p| p <= 32)
+    }
+}
+
 /// Errors from network bring-up. All variants carry only non-secret material
 /// (interface names, IPs, errnos), so logging a `NetError` is safe (§9).
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +154,10 @@ pub enum NetError {
     /// `BOOTIF` was given but no interface's MAC matched it.
     #[error("BOOTIF MAC {0} matched no interface")]
     BootifNoMatch(String),
+    /// `beskar7.ip` (static config) was set on a multi-NIC host with no `BOOTIF`,
+    /// so there is no way to know which interface the static address belongs to.
+    #[error("static beskar7.ip with multiple NICs and no BOOTIF to pin one")]
+    StaticAmbiguous,
     /// A required `/sys/class/net/<iface>/...` attribute could not be read.
     #[error("reading {0}")]
     SysRead(String),
@@ -123,9 +193,19 @@ enum NicSelection {
 /// (D-013). Live entry point; the policy pieces it calls (`select_nics`,
 /// `choose_lease`) are pure and unit-tested.
 pub fn bring_up_provisioning_network(params: &BootParams) -> Result<NetConfig, NetError> {
-    match select_nics(Path::new(SYSFS_NET), params.bootif.as_deref())? {
-        NicSelection::Pinned(iface) => bring_up_one(&iface),
-        NicSelection::Race(ifaces) => bring_up_race(&ifaces),
+    let selection = select_nics(Path::new(SYSFS_NET), params.bootif.as_deref())?;
+    match &params.ip {
+        // Static config (`beskar7.ip`, D-013): no DHCP. It needs a single pinned
+        // interface — `BOOTIF` or a lone NIC — because, without a lease, there is
+        // nothing to disambiguate which of several NICs the address belongs to.
+        Some(static_ip) => match selection {
+            NicSelection::Pinned(iface) => bring_up_static(&iface, static_ip),
+            NicSelection::Race(_) => Err(NetError::StaticAmbiguous),
+        },
+        None => match selection {
+            NicSelection::Pinned(iface) => bring_up_one(&iface),
+            NicSelection::Race(ifaces) => bring_up_race(&ifaces),
+        },
     }
 }
 
@@ -137,6 +217,35 @@ fn bring_up_one(iface: &str) -> Result<NetConfig, NetError> {
     let lease = dhcp_link(iface, ifindex, mac)?;
     apply_lease(ifindex, &lease)?;
     Ok(net_config(iface, lease))
+}
+
+/// Configure a pinned interface from a static `beskar7.ip` spec — no DHCP
+/// (D-013). Any DNS servers ride `NetConfig.dns` to the `/etc/resolv.conf` writer,
+/// the same path the DHCP lease uses.
+fn bring_up_static(iface: &str, s: &StaticIp) -> Result<NetConfig, NetError> {
+    let ifindex = read_ifindex(iface)?;
+    netlink::link_up(ifindex).map_err(|source| NetError::Netlink {
+        op: "link up",
+        source,
+    })?;
+    wait_for_link(iface);
+    netlink::add_address(ifindex, s.ip, s.prefix_len).map_err(|source| NetError::Netlink {
+        op: "add address",
+        source,
+    })?;
+    if let Some(gw) = s.gateway {
+        netlink::add_default_route(ifindex, gw).map_err(|source| NetError::Netlink {
+            op: "add default route",
+            source,
+        })?;
+    }
+    Ok(NetConfig {
+        iface: iface.to_string(),
+        ip: s.ip,
+        prefix_len: s.prefix_len,
+        gateway: s.gateway,
+        dns: s.dns.clone(),
+    })
 }
 
 /// Bring every candidate link up, DHCP each concurrently, and apply the winning
@@ -580,5 +689,54 @@ mod tests {
             render_resolv_conf(&dns),
             "nameserver 10.0.0.1\nnameserver 10.0.0.2\nnameserver 10.0.0.3\n"
         );
+    }
+
+    #[test]
+    fn static_ip_parse_full_form() {
+        let s = StaticIp::parse("192.168.150.10::192.168.150.1:255.255.255.0:8.8.8.8").unwrap();
+        assert_eq!(
+            s,
+            StaticIp {
+                ip: Ipv4Addr::new(192, 168, 150, 10),
+                gateway: Some(Ipv4Addr::new(192, 168, 150, 1)),
+                prefix_len: 24,
+                dns: vec![Ipv4Addr::new(8, 8, 8, 8)],
+            }
+        );
+    }
+
+    #[test]
+    fn static_ip_parse_no_gateway_no_dns() {
+        // Empty gateway field -> None; no dns field -> empty.
+        let s = StaticIp::parse("10.0.0.5:::255.255.0.0").unwrap();
+        assert_eq!(s.ip, Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(s.gateway, None);
+        assert_eq!(s.prefix_len, 16);
+        assert!(s.dns.is_empty());
+    }
+
+    #[test]
+    fn static_ip_parse_accepts_cidr_prefix_mask() {
+        // The <mask> field may be a bare prefix length instead of a dotted mask.
+        let s = StaticIp::parse("172.16.0.9::172.16.0.1:24").unwrap();
+        assert_eq!(s.prefix_len, 24);
+        assert_eq!(s.gateway, Some(Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(s.dns.is_empty());
+    }
+
+    #[test]
+    fn static_ip_parse_rejects_malformed() {
+        // Too few fields.
+        assert_eq!(StaticIp::parse("192.168.1.1:255.255.255.0"), None);
+        // Bad client IP.
+        assert_eq!(StaticIp::parse("not-an-ip::10.0.0.1:24"), None);
+        // Bad gateway.
+        assert_eq!(StaticIp::parse("10.0.0.5::nope:24"), None);
+        // Out-of-range prefix.
+        assert_eq!(StaticIp::parse("10.0.0.5::10.0.0.1:33"), None);
+        // Bad netmask.
+        assert_eq!(StaticIp::parse("10.0.0.5::10.0.0.1:not-a-mask"), None);
+        // Too many fields.
+        assert_eq!(StaticIp::parse("10.0.0.5::10.0.0.1:24:8.8.8.8:extra"), None);
     }
 }
