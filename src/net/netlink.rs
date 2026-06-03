@@ -43,7 +43,14 @@ const SEQ: u32 = 1;
 
 /// Bring interface `ifindex` administratively up (`RTM_NEWLINK`, `IFF_UP`).
 pub fn link_up(ifindex: u32) -> Result<(), Errno> {
-    send_and_ack(&build_link_up(ifindex))
+    send_and_ack(&build_link_set_flags(ifindex, IFF_UP))
+}
+
+/// Bring interface `ifindex` administratively down (`RTM_NEWLINK`, clear `IFF_UP`).
+/// Used to tear the losing links back down after the multi-NIC DHCP race (D-013),
+/// so exactly one interface is left up and addressed.
+pub fn link_down(ifindex: u32) -> Result<(), Errno> {
+    send_and_ack(&build_link_set_flags(ifindex, 0))
 }
 
 /// Assign `ip/prefix_len` to interface `ifindex` (`RTM_NEWADDR`).
@@ -86,7 +93,10 @@ fn finalize(buf: &mut [u8]) {
     buf[0..4].copy_from_slice(&len.to_ne_bytes());
 }
 
-fn build_link_up(ifindex: u32) -> Vec<u8> {
+/// Build an `RTM_NEWLINK` that sets `ifi_flags` to `flags` within the `IFF_UP`
+/// change mask: `IFF_UP` brings the link up, `0` brings it down. The mask is
+/// always just `IFF_UP`, so no other link flag is touched.
+fn build_link_set_flags(ifindex: u32, flags: u32) -> Vec<u8> {
     let mut b = Vec::with_capacity(NLMSGHDR_LEN + IFINFOMSG_LEN);
     push_nlmsghdr(&mut b, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK);
     // ifinfomsg: family, pad, type(u16), index(i32), flags(u32), change(u32)
@@ -94,8 +104,8 @@ fn build_link_up(ifindex: u32) -> Vec<u8> {
     b.push(0); // pad
     b.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
     b.extend_from_slice(&(ifindex as i32).to_ne_bytes());
-    b.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_flags
-    b.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_change mask
+    b.extend_from_slice(&flags.to_ne_bytes()); // ifi_flags
+    b.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_change mask: only IFF_UP
     finalize(&mut b);
     b
 }
@@ -259,16 +269,34 @@ mod tests {
 
     #[test]
     fn link_up_message_is_well_formed() {
-        let b = build_link_up(3);
+        let b = build_link_set_flags(3, IFF_UP);
         assert_eq!(nlmsg_len(&b) as usize, b.len());
         assert_eq!(nlmsg_len(&b) as usize, NLMSGHDR_LEN + IFINFOMSG_LEN);
         assert_eq!(nlmsg_type(&b), RTM_NEWLINK);
         // ifi_index (i32) at offset NLMSGHDR_LEN + 4.
         let idx = i32::from_ne_bytes(b[NLMSGHDR_LEN + 4..NLMSGHDR_LEN + 8].try_into().unwrap());
         assert_eq!(idx, 3);
-        // ifi_flags carries IFF_UP.
+        // ifi_flags carries IFF_UP; the change mask is exactly IFF_UP.
         let flags = u32::from_ne_bytes(b[NLMSGHDR_LEN + 8..NLMSGHDR_LEN + 12].try_into().unwrap());
         assert_eq!(flags & IFF_UP, IFF_UP);
+        let change =
+            u32::from_ne_bytes(b[NLMSGHDR_LEN + 12..NLMSGHDR_LEN + 16].try_into().unwrap());
+        assert_eq!(change, IFF_UP);
+    }
+
+    #[test]
+    fn link_down_clears_iff_up_within_the_same_mask() {
+        let b = build_link_set_flags(7, 0);
+        assert_eq!(nlmsg_type(&b), RTM_NEWLINK);
+        let idx = i32::from_ne_bytes(b[NLMSGHDR_LEN + 4..NLMSGHDR_LEN + 8].try_into().unwrap());
+        assert_eq!(idx, 7);
+        // ifi_flags has IFF_UP cleared, but the change mask still scopes the write
+        // to IFF_UP so no unrelated link flag is disturbed.
+        let flags = u32::from_ne_bytes(b[NLMSGHDR_LEN + 8..NLMSGHDR_LEN + 12].try_into().unwrap());
+        assert_eq!(flags & IFF_UP, 0);
+        let change =
+            u32::from_ne_bytes(b[NLMSGHDR_LEN + 12..NLMSGHDR_LEN + 16].try_into().unwrap());
+        assert_eq!(change, IFF_UP);
     }
 
     #[test]

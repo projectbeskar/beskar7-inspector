@@ -11,20 +11,30 @@
 //! immediately after [`crate::modules::load_drivers`] and before the callback
 //! client. It:
 //!   1. selects the provisioning NIC — by the `BOOTIF=<mac>` cmdline param (the
-//!      pxelinux/iPXE convention: the NIC that just PXE-booted), or the single
-//!      physical NIC when only one is present;
+//!      pxelinux/iPXE convention: the NIC that just PXE-booted), the single
+//!      physical NIC when only one is present, or — when several are present and
+//!      none is pinned — by DHCP-racing all of them and taking the winner;
 //!   2. brings the link up (RTNETLINK `RTM_NEWLINK`);
 //!   3. runs a one-shot DHCP exchange (DISCOVER/OFFER/REQUEST/ACK), hand-rolled —
 //!      the inspector runs once then reboots, so there is no lease renewal;
 //!   4. assigns the leased address + default route (RTNETLINK `RTM_NEWADDR` /
 //!      `RTM_NEWROUTE`).
 //!
-//! ## Scope (Smoke-1 minimum)
-//! Single-NIC DHCP. DNS is out of scope — `beskar7.api` is expected to be an
-//! IP-literal (contract §8). The multi-NIC "DHCP every link and race", a
-//! `beskar7.ip=` static fallback, VLAN, and DHCP-option-6 → `/etc/resolv.conf`
-//! are deliberate D-013 follow-ups; the single entry point is shaped so they land
-//! additively without touching the `run()` call site.
+//! ## Multi-NIC (D-013 breadth)
+//! When several NICs are present and `BOOTIF` does not pin one, the inspector
+//! brings every candidate link up, runs DHCP on each concurrently (each socket is
+//! `SO_BINDTODEVICE`-scoped, so the exchanges do not cross links), and applies the
+//! winner — preferring a lease that carries a default gateway (that network has a
+//! route toward `beskar7.api`), then the lowest-sorted interface name. Only the
+//! winner is left addressed; the losing links are brought back down. `BOOTIF`
+//! remains the deterministic pin and the recommended path; the race is the
+//! fallback for hosts whose first-stage iPXE does not supply `?mac=`.
+//!
+//! ## Remaining scope
+//! DNS is still out of scope — `beskar7.api` is expected to be an IP-literal
+//! (contract §8). A `beskar7.ip=` static fallback, VLAN tagging, and the
+//! DHCP-option-6 → `/etc/resolv.conf` writer remain deliberate D-013 follow-ups;
+//! the single entry point is shaped so they land additively.
 //!
 //! ## Secret hygiene (§9)
 //! No secret passes through here — DHCP is unauthenticated by design and the
@@ -42,6 +52,7 @@ use nix::errno::Errno;
 
 use crate::cmdline::BootParams;
 use crate::probe::read_trimmed;
+use dhcp::Lease;
 
 /// `/sys/class/net` — one entry per network interface.
 const SYSFS_NET: &str = "/sys/class/net";
@@ -69,9 +80,6 @@ pub enum NetError {
     /// No usable (non-loopback) network interface was found.
     #[error("no network interface found")]
     NoInterface,
-    /// More than one NIC is present and no `BOOTIF` pinned which to use.
-    #[error("multiple NICs and no BOOTIF to select one: {0}")]
-    AmbiguousInterface(String),
     /// `BOOTIF` was given but no interface's MAC matched it.
     #[error("BOOTIF MAC {0} matched no interface")]
     BootifNoMatch(String),
@@ -98,21 +106,105 @@ pub enum NetError {
     },
 }
 
-/// Bring up the provisioning network and return the applied configuration
-/// (D-013). Live entry point; the policy pieces it calls are pure and tested.
-pub fn bring_up_provisioning_network(params: &BootParams) -> Result<NetConfig, NetError> {
-    let iface = select_nic(Path::new(SYSFS_NET), params.bootif.as_deref())?;
-    let ifindex = read_ifindex(&iface)?;
-    let mac = read_mac(&iface)?;
+/// Outcome of NIC pre-selection over `/sys/class/net`.
+enum NicSelection {
+    /// Exactly one interface to use: a `BOOTIF` match, or the only NIC present.
+    Pinned(String),
+    /// No `BOOTIF` and several NICs — bring them all up and DHCP-race them.
+    Race(Vec<String>),
+}
 
+/// Bring up the provisioning network and return the applied configuration
+/// (D-013). Live entry point; the policy pieces it calls (`select_nics`,
+/// `choose_lease`) are pure and unit-tested.
+pub fn bring_up_provisioning_network(params: &BootParams) -> Result<NetConfig, NetError> {
+    match select_nics(Path::new(SYSFS_NET), params.bootif.as_deref())? {
+        NicSelection::Pinned(iface) => bring_up_one(&iface),
+        NicSelection::Race(ifaces) => bring_up_race(&ifaces),
+    }
+}
+
+/// Configure a single, already-chosen interface: bring the link up, DHCP, apply
+/// the lease. The BOOTIF / single-NIC path.
+fn bring_up_one(iface: &str) -> Result<NetConfig, NetError> {
+    let ifindex = read_ifindex(iface)?;
+    let mac = read_mac(iface)?;
+    let lease = dhcp_link(iface, ifindex, mac)?;
+    apply_lease(ifindex, &lease)?;
+    Ok(net_config(iface, lease))
+}
+
+/// Bring every candidate link up, DHCP each concurrently, and apply the winning
+/// lease — leaving exactly one interface configured (the losers are brought back
+/// down). The winner is chosen deterministically by [`choose_lease`].
+fn bring_up_race(ifaces: &[String]) -> Result<NetConfig, NetError> {
+    // Resolve ifindex + MAC up front; skip any candidate whose sysfs we can't
+    // read rather than failing the whole race for one bad NIC.
+    let cands: Vec<(String, u32, [u8; 6])> = ifaces
+        .iter()
+        .filter_map(|iface| {
+            let ifindex = read_ifindex(iface).ok()?;
+            let mac = read_mac(iface).ok()?;
+            Some((iface.clone(), ifindex, mac))
+        })
+        .collect();
+    if cands.is_empty() {
+        return Err(NetError::NoInterface);
+    }
+
+    // DHCP every link concurrently. Each acquire() binds its socket to its own
+    // interface (SO_BINDTODEVICE), so the exchanges do not cross links. The wall
+    // time is the slowest single link's DHCP budget, not the sum.
+    let results: Vec<(String, u32, Option<Lease>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = cands
+            .iter()
+            .map(|(iface, ifindex, mac)| {
+                let (iface, ifindex, mac) = (iface.clone(), *ifindex, *mac);
+                scope.spawn(move || dhcp_link(&iface, ifindex, mac).ok())
+            })
+            .collect();
+        cands
+            .iter()
+            .zip(handles)
+            .map(|((iface, ifindex, _), handle)| {
+                (iface.clone(), *ifindex, handle.join().unwrap_or(None))
+            })
+            .collect()
+    });
+
+    let leases: Vec<Option<Lease>> = results.iter().map(|(_, _, lease)| lease.clone()).collect();
+    let winner = choose_lease(&leases).ok_or(NetError::DhcpTimeout)?;
+
+    // Apply the winner; bring every other link back down so exactly one interface
+    // is left up and addressed. Only the winner is ever given an address, so the
+    // "one configured link" invariant holds even if a teardown fails — a loser is
+    // then at worst left administratively up but unaddressed (no IP, no route).
+    let win_iface = results[winner].0.clone();
+    let win_ifindex = results[winner].1;
+    let win_lease = leases[winner]
+        .clone()
+        .expect("winner index carries a lease");
+    apply_lease(win_ifindex, &win_lease)?;
+    for (idx, (_, ifindex, _)) in results.iter().enumerate() {
+        if idx != winner {
+            let _ = netlink::link_down(*ifindex);
+        }
+    }
+    Ok(net_config(&win_iface, win_lease))
+}
+
+/// Bring `iface` up, wait for carrier, and run one DHCP exchange.
+fn dhcp_link(iface: &str, ifindex: u32, mac: [u8; 6]) -> Result<Lease, NetError> {
     netlink::link_up(ifindex).map_err(|source| NetError::Netlink {
         op: "link up",
         source,
     })?;
-    wait_for_link(&iface);
+    wait_for_link(iface);
+    dhcp::acquire(iface, mac)
+}
 
-    let lease = dhcp::acquire(&iface, mac)?;
-
+/// Apply a lease to `ifindex`: assign the address and, if present, the default route.
+fn apply_lease(ifindex: u32, lease: &Lease) -> Result<(), NetError> {
     netlink::add_address(ifindex, lease.ip, lease.prefix_len).map_err(|source| {
         NetError::Netlink {
             op: "add address",
@@ -125,21 +217,37 @@ pub fn bring_up_provisioning_network(params: &BootParams) -> Result<NetConfig, N
             source,
         })?;
     }
+    Ok(())
+}
 
-    Ok(NetConfig {
-        iface,
+/// Build the public [`NetConfig`] from a winning interface and its lease.
+fn net_config(iface: &str, lease: Lease) -> NetConfig {
+    NetConfig {
+        iface: iface.to_string(),
         ip: lease.ip,
         prefix_len: lease.prefix_len,
         gateway: lease.gateway,
         dns: lease.dns,
-    })
+    }
 }
 
-/// Select the provisioning interface from `net_dir` (a `/sys/class/net`-shaped
-/// directory). With `bootif`, returns the interface whose MAC matches; otherwise
-/// the single non-loopback interface (erroring if there are several). Pure over
-/// the directory, so the selection policy is unit-tested.
-fn select_nic(net_dir: &Path, bootif: Option<&str>) -> Result<String, NetError> {
+/// Choose the winning interface among raced DHCP results (pure; unit-tested).
+/// `leases` is in candidate order, which `select_nics` sorts by interface name.
+/// Prefers a lease that carries a default gateway — that network has a route
+/// toward `beskar7.api` — and otherwise the lowest-sorted interface that leased
+/// at all. Returns `None` when no interface obtained a lease.
+fn choose_lease(leases: &[Option<Lease>]) -> Option<usize> {
+    leases
+        .iter()
+        .position(|lease| lease.as_ref().is_some_and(|l| l.gateway.is_some()))
+        .or_else(|| leases.iter().position(Option::is_some))
+}
+
+/// Select the provisioning interface(s) from `net_dir` (a `/sys/class/net`-shaped
+/// directory). With `bootif`, pins the interface whose MAC matches; with a single
+/// non-loopback NIC, pins it; with several and no `BOOTIF`, returns them all to be
+/// raced. Pure over the directory, so the selection policy is unit-tested.
+fn select_nics(net_dir: &Path, bootif: Option<&str>) -> Result<NicSelection, NetError> {
     let mut candidates: Vec<String> = match std::fs::read_dir(net_dir) {
         Ok(rd) => rd
             .flatten()
@@ -158,7 +266,7 @@ fn select_nic(net_dir: &Path, bootif: Option<&str>) -> Result<String, NetError> 
         for iface in &candidates {
             if let Some(mac) = read_trimmed(&net_dir.join(iface).join("address")) {
                 if mac.eq_ignore_ascii_case(&want) {
-                    return Ok(iface.clone());
+                    return Ok(NicSelection::Pinned(iface.clone()));
                 }
             }
         }
@@ -166,8 +274,8 @@ fn select_nic(net_dir: &Path, bootif: Option<&str>) -> Result<String, NetError> 
     }
 
     match candidates.as_slice() {
-        [only] => Ok(only.clone()),
-        many => Err(NetError::AmbiguousInterface(many.join(", "))),
+        [only] => Ok(NicSelection::Pinned(only.clone())),
+        _ => Ok(NicSelection::Race(candidates)),
     }
 }
 
@@ -246,53 +354,114 @@ mod tests {
         write(root, &format!("{name}/ifindex"), "2\n");
     }
 
+    fn lease_with(gateway: Option<[u8; 4]>) -> Lease {
+        Lease {
+            ip: Ipv4Addr::new(192, 168, 1, 10),
+            prefix_len: 24,
+            gateway: gateway.map(Ipv4Addr::from),
+            dns: vec![],
+        }
+    }
+
     #[test]
-    fn select_nic_single_non_loopback() {
+    fn select_nics_single_non_loopback_is_pinned() {
         let s = Scratch::new("net-single");
         write(s.path(), "lo/address", "00:00:00:00:00:00\n");
         write_iface(s.path(), "eth0", "52:54:00:12:34:56");
-        assert_eq!(select_nic(s.path(), None).unwrap(), "eth0");
+        match select_nics(s.path(), None) {
+            Ok(NicSelection::Pinned(iface)) => assert_eq!(iface, "eth0"),
+            _ => panic!("expected Pinned(eth0)"),
+        }
     }
 
     #[test]
-    fn select_nic_ambiguous_without_bootif_errors() {
+    fn select_nics_multiple_without_bootif_races_all_sorted() {
         let s = Scratch::new("net-ambig");
-        write_iface(s.path(), "eth0", "52:54:00:00:00:01");
+        // Insert out of order; the candidate list must come back sorted so the
+        // race tie-break is deterministic.
         write_iface(s.path(), "eth1", "52:54:00:00:00:02");
-        assert!(matches!(
-            select_nic(s.path(), None),
-            Err(NetError::AmbiguousInterface(_))
-        ));
+        write_iface(s.path(), "eth0", "52:54:00:00:00:01");
+        match select_nics(s.path(), None) {
+            Ok(NicSelection::Race(ifaces)) => assert_eq!(ifaces, vec!["eth0", "eth1"]),
+            _ => panic!("expected Race over both NICs"),
+        }
     }
 
     #[test]
-    fn select_nic_bootif_matches_mac() {
+    fn select_nics_bootif_matches_mac() {
         let s = Scratch::new("net-bootif");
         write_iface(s.path(), "eth0", "52:54:00:00:00:01");
         write_iface(s.path(), "eth1", "52:54:00:aa:bb:cc");
         // pxelinux form: 01- prefix, dashes, any case.
-        let got = select_nic(s.path(), Some("01-52-54-00-AA-BB-CC")).unwrap();
-        assert_eq!(got, "eth1");
+        match select_nics(s.path(), Some("01-52-54-00-AA-BB-CC")) {
+            Ok(NicSelection::Pinned(iface)) => assert_eq!(iface, "eth1"),
+            _ => panic!("expected Pinned(eth1)"),
+        }
     }
 
     #[test]
-    fn select_nic_bootif_no_match_errors() {
+    fn select_nics_bootif_no_match_errors() {
         let s = Scratch::new("net-bootif-miss");
+        // Two NICs so the no-match can't silently fall through to single-NIC.
         write_iface(s.path(), "eth0", "52:54:00:00:00:01");
+        write_iface(s.path(), "eth1", "52:54:00:00:00:02");
         assert!(matches!(
-            select_nic(s.path(), Some("01-de-ad-be-ef-00-00")),
+            select_nics(s.path(), Some("01-de-ad-be-ef-00-00")),
             Err(NetError::BootifNoMatch(_))
         ));
     }
 
     #[test]
-    fn select_nic_no_interface() {
+    fn select_nics_no_interface() {
         let s = Scratch::new("net-none");
         write(s.path(), "lo/address", "00:00:00:00:00:00\n");
         assert!(matches!(
-            select_nic(s.path(), None),
+            select_nics(s.path(), None),
             Err(NetError::NoInterface)
         ));
+    }
+
+    #[test]
+    fn choose_lease_none_when_nothing_leased() {
+        assert_eq!(choose_lease(&[]), None);
+        assert_eq!(choose_lease(&[None, None]), None);
+    }
+
+    #[test]
+    fn choose_lease_prefers_a_lease_with_a_gateway() {
+        // eth0 leased but no gateway; eth1 has one -> eth1 (index 1) wins.
+        let leases = [
+            Some(lease_with(None)),
+            Some(lease_with(Some([192, 168, 1, 1]))),
+        ];
+        assert_eq!(choose_lease(&leases), Some(1));
+    }
+
+    #[test]
+    fn choose_lease_gateway_beats_an_earlier_gatewayless_lease() {
+        // index 0 leased without a gateway, index 2 with one -> 2 wins over 0.
+        let leases = [
+            Some(lease_with(None)),
+            None,
+            Some(lease_with(Some([10, 0, 0, 1]))),
+        ];
+        assert_eq!(choose_lease(&leases), Some(2));
+    }
+
+    #[test]
+    fn choose_lease_lowest_index_among_gatewayed() {
+        let leases = [
+            Some(lease_with(Some([10, 0, 0, 1]))),
+            Some(lease_with(Some([10, 0, 1, 1]))),
+        ];
+        assert_eq!(choose_lease(&leases), Some(0));
+    }
+
+    #[test]
+    fn choose_lease_falls_back_to_lowest_index_lease_without_gateway() {
+        // No lease has a gateway; the lowest-index lease (skipping the gap) wins.
+        let leases = [None, Some(lease_with(None)), Some(lease_with(None))];
+        assert_eq!(choose_lease(&leases), Some(1));
     }
 
     #[test]
