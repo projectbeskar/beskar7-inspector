@@ -130,6 +130,12 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
             "beskar7-inspector: network up on {} ({}/{})",
             net.iface, net.ip, net.prefix_len
         );
+        // Write DHCP-provided DNS (option 6) so a hostname beskar7.api resolves.
+        // Best-effort: an IP-literal beskar7.api (the recommended form, §8.2) needs
+        // no resolver, so a write failure must not abort provisioning.
+        if let Err(e) = net::write_resolv_conf(&net.dns) {
+            eprintln!("beskar7-inspector: could not write /etc/resolv.conf: {e}");
+        }
     }
 
     // ── Phase 1: enroll & inspect (always) ──────────────────────────────────
