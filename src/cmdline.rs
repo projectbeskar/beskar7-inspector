@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use crate::net::StaticIp;
 use crate::secret::Secret;
 
 /// The boot parameters the controller renders onto the kernel cmdline (§5).
@@ -62,6 +63,12 @@ pub struct BootParams {
     /// established netboot convention. Non-secret; `None` if absent (then `net`
     /// falls back to the single physical NIC).
     pub bootif: Option<String>,
+    /// `beskar7.ip` — optional static network configuration for DHCP-less /
+    /// VLAN-pinned provisioning networks (D-013), in the kernel-`ip=` subset
+    /// `<ip>::<gw>:<mask>[:<dns>]`. When `Some`, [`crate::net`] configures the
+    /// pinned NIC statically and skips DHCP; when `None`, DHCP is used. Parsing
+    /// and the static-vs-DHCP branch are `net`'s responsibility (§8.2).
+    pub ip: Option<StaticIp>,
     /// `beskar7.timeout` — optional inspector-side overall timeout.
     pub timeout: Option<Duration>,
     /// `beskar7.debug` — verbose logging / debug shell on failure.
@@ -79,6 +86,11 @@ pub enum CmdlineError {
     /// `beskar7.timeout` was present but not a non-negative integer of seconds.
     #[error("beskar7.timeout is not a valid non-negative integer number of seconds")]
     InvalidTimeout,
+    /// `beskar7.ip` was present but not the `<ip>::<gw>:<mask>[:<dns>]` form. Static
+    /// config is explicitly requested, so a malformed value fails rather than
+    /// silently falling back to DHCP.
+    #[error("beskar7.ip is not a valid static network spec (<ip>::<gw>:<mask>[:<dns>])")]
+    InvalidStaticIp,
     /// `/proc/cmdline` could not be read.
     #[error("reading /proc/cmdline")]
     Io(#[from] std::io::Error),
@@ -105,6 +117,7 @@ impl BootParams {
         let mut ca = None;
         let mut disk = None;
         let mut bootif = None;
+        let mut ip = None;
         let mut timeout = None;
         let mut debug = false;
 
@@ -125,6 +138,11 @@ impl BootParams {
                 "beskar7.disk" => disk = non_empty(value),
                 // The pxelinux/iPXE netboot convention (not a beskar7.* key).
                 "BOOTIF" => bootif = non_empty(value),
+                "beskar7.ip" => {
+                    if let Some(v) = non_empty(value) {
+                        ip = Some(StaticIp::parse(&v).ok_or(CmdlineError::InvalidStaticIp)?);
+                    }
+                }
                 "beskar7.timeout" => {
                     if !value.is_empty() {
                         let secs: u64 = value.parse().map_err(|_| CmdlineError::InvalidTimeout)?;
@@ -165,6 +183,7 @@ impl BootParams {
             ca: ca.expect("ca present"),
             disk,
             bootif,
+            ip,
             timeout,
             debug,
         })
@@ -244,6 +263,33 @@ mod tests {
         let pinned = format!("{} beskar7.disk=/dev/disk/by-id/nvme-FOO", minimal());
         let p = BootParams::parse(&pinned).expect("valid");
         assert_eq!(p.disk.as_deref(), Some("/dev/disk/by-id/nvme-FOO"));
+    }
+
+    #[test]
+    fn optional_ip_is_none_when_absent_and_parsed_when_set() {
+        // Absent -> DHCP path.
+        let p = BootParams::parse(&minimal()).expect("valid");
+        assert_eq!(p.ip, None);
+
+        // Present -> parsed into a StaticIp (full parse is covered in net::tests).
+        let line = format!(
+            "{} beskar7.ip=192.168.150.10::192.168.150.1:255.255.255.0",
+            minimal()
+        );
+        let p = BootParams::parse(&line).expect("valid");
+        let ip = p.ip.expect("static ip parsed");
+        assert_eq!(ip.ip, std::net::Ipv4Addr::new(192, 168, 150, 10));
+        assert_eq!(ip.gateway, Some(std::net::Ipv4Addr::new(192, 168, 150, 1)));
+        assert_eq!(ip.prefix_len, 24);
+    }
+
+    #[test]
+    fn malformed_ip_is_a_named_error_not_a_silent_dhcp_fallback() {
+        let line = format!("{} beskar7.ip=garbage", minimal());
+        assert!(matches!(
+            BootParams::parse(&line),
+            Err(CmdlineError::InvalidStaticIp)
+        ));
     }
 
     #[test]

@@ -27,4 +27,4 @@ pub mod target_disk;
 /// Changing the wire format, auth, endpoints, or cmdline parameters is a
 /// contract version change that must be coordinated across both repos and the
 /// shared golden fixture (see that document's "Versioning and anti-drift").
-pub const CONTRACT_VERSION: &str = "v2";
+pub const CONTRACT_VERSION: &str = "v3";
