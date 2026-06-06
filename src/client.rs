@@ -1,13 +1,18 @@
 //! Verified-TLS callback client: submit the inspection report and fetch the CAPI
 //! bootstrap user-data (contract §4.2/§4.3/§8/§9).
 //!
-//! Two requests, both `Authorization: Bearer <token>` over TLS verified against
+//! Three requests, all `Authorization: Bearer <token>` over TLS verified against
 //! the CA delivered on the cmdline (`beskar7.ca`):
 //!   * `POST {api}/api/v1/inspection/{ns}/{host}` — the §6 report. Success is
 //!     **202 Accepted** (the controller writes status asynchronously); the client
 //!     treats any 2xx as success and retries only *transient* failures.
 //!   * `GET {api}/api/v1/bootstrap/{ns}/{host}` — raw CAPI user-data bytes (which
 //!     **may contain cluster join secrets**, contract §4.3/§9).
+//!   * `POST {api}/api/v1/provisioned/{ns}/{host}` — the provisioning-complete
+//!     callback (D-015), fired after the verified whole-disk write + OEM inject
+//!     and before the reboot, so the controller learns the deploy outcome. Body is
+//!     the fixed advisory `{"status":"provisioned"}`; success is **202 Accepted**,
+//!     same retry policy as the inspection POST.
 //!
 //! ## TLS posture (§8)
 //! The root store holds *only* the delivered CA — [`RootCertStore::empty`] plus
@@ -48,6 +53,10 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ignition) is far smaller than this; a larger response is treated as an error
 /// rather than buffered, so a buggy or hostile server cannot exhaust memory.
 const MAX_BOOTSTRAP_BYTES: u64 = 4 * 1024 * 1024;
+/// The fixed, advisory body of the provisioning-complete callback (D-015). The
+/// server treats it as advisory — the path/host carry the identity — so it is a
+/// small constant and carries nothing secret.
+const PROVISIONED_BODY: &[u8] = br#"{"status":"provisioned"}"#;
 
 /// Errors from the callback client. Variants deliberately carry no URLs, headers,
 /// or bodies — only status codes and transport-error kinds — so logging a
@@ -92,6 +101,7 @@ pub struct CallbackClient {
     agent: ureq::Agent,
     inspection_url: String,
     bootstrap_url: String,
+    provisioned_url: String,
     token: Secret,
 }
 
@@ -112,6 +122,7 @@ impl CallbackClient {
             agent,
             inspection_url: inspection_url(&params.api, &params.namespace, &params.host),
             bootstrap_url: bootstrap_url(&params.api, &params.namespace, &params.host),
+            provisioned_url: provisioned_url(&params.api, &params.namespace, &params.host),
             token: params.token.clone(),
         })
     }
@@ -155,6 +166,27 @@ impl CallbackClient {
                     }
                     Err(e) => Attempt::Retry(e),
                 },
+                Err(verdict) => verdict.into_attempt(),
+            }
+        })
+    }
+
+    /// POST the provisioning-complete callback after the verified deploy and
+    /// before the reboot (D-015), so the controller learns the host provisioned.
+    /// Mirrors [`submit_report`](Self::submit_report): the fixed advisory
+    /// [`PROVISIONED_BODY`], the same bearer, 202 (any 2xx) treated as success,
+    /// transient transport/5xx failures retried with backoff.
+    pub fn provisioned(&self) -> Result<(), ClientError> {
+        let auth = self.bearer();
+        run_with_retries(MAX_ATTEMPTS, sleep, |_| {
+            let result = self
+                .agent
+                .post(&self.provisioned_url)
+                .set("Authorization", &auth)
+                .set("Content-Type", "application/json")
+                .send_bytes(PROVISIONED_BODY);
+            match classify_status(result) {
+                Ok(_resp) => Attempt::Done(()),
                 Err(verdict) => verdict.into_attempt(),
             }
         })
@@ -340,6 +372,16 @@ fn bootstrap_url(api: &str, namespace: &str, host: &str) -> String {
     )
 }
 
+/// `{api}/api/v1/provisioned/{ns}/{host}`, tolerating a trailing slash on `api`.
+fn provisioned_url(api: &str, namespace: &str, host: &str) -> String {
+    format!(
+        "{}/api/v1/provisioned/{}/{}",
+        api.trim_end_matches('/'),
+        namespace,
+        host
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +415,10 @@ mod tests {
             bootstrap_url("https://h:8082", "ns", "node-1"),
             "https://h:8082/api/v1/bootstrap/ns/node-1"
         );
+        assert_eq!(
+            provisioned_url("https://h:8082", "ns", "node-1"),
+            "https://h:8082/api/v1/provisioned/ns/node-1"
+        );
     }
 
     #[test]
@@ -381,6 +427,15 @@ mod tests {
             inspection_url("https://h:8082/", "ns", "h"),
             "https://h:8082/api/v1/inspection/ns/h"
         );
+        assert_eq!(
+            provisioned_url("https://h:8082/", "ns", "h"),
+            "https://h:8082/api/v1/provisioned/ns/h"
+        );
+    }
+
+    #[test]
+    fn provisioned_body_is_the_fixed_advisory_json() {
+        assert_eq!(PROVISIONED_BODY, br#"{"status":"provisioned"}"#);
     }
 
     #[test]

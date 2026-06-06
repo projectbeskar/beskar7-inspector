@@ -16,7 +16,9 @@
 //! re-read the partition table                           deploy::reread_partition_table
 //! locate COS_OEM on the target disk                     oem::find_oem_partition
 //! mount COS_OEM, inject 99_beskar7.yaml, unmount        deploy::inject_oem_config
-//! zero the user-data buffer, then reboot(2)             deploy::reboot_now
+//! zero the user-data buffer                             drop(user_data)
+//! POST the provisioned-complete callback (202)          client::provisioned
+//! reboot(2)                                             deploy::reboot_now
 //! ```
 //!
 //! ## Secret hygiene (§9)
@@ -182,7 +184,18 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
     deploy::inject_oem_config(&oem_partition, &user_data)?;
 
     // Zero the join secret before handing control to the firmware (§9.1 step 6).
+    // The provisioned callback below carries no secret, so it is safe to fire
+    // after the secret is gone.
     drop(user_data);
+
+    // Tell the controller the deploy succeeded BEFORE rebooting (D-015): the host
+    // is about to reboot into the target OS and never runs the inspector again, so
+    // a silent reboot would leave the controller unable to confirm provisioning.
+    // As critical as the inspection POST — a retries-exhausted failure propagates
+    // (as RunError::Client) rather than rebooting silently, so the controller can
+    // re-drive the host.
+    client.provisioned()?;
+    eprintln!("beskar7-inspector: provisioned-complete callback accepted");
 
     eprintln!("beskar7-inspector: provisioned, rebooting into the target OS");
     Err(RunError::Deploy(deploy::reboot_now()))
