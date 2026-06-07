@@ -13,6 +13,14 @@
 //!     and before the reboot, so the controller learns the deploy outcome. Body is
 //!     the fixed advisory `{"status":"provisioned"}`; success is **202 Accepted**,
 //!     same retry policy as the inspection POST.
+//!   * `POST {api}/api/v1/provision-failed/{ns}/{host}` — the provision-failed
+//!     callback (D-015 v4.1), fired on a deploy-step failure (image fetch/digest/
+//!     whole-disk write/partition re-read/`COS_OEM` inject) *after* the host has
+//!     moved to Deploying, so the controller fails the machine promptly instead of
+//!     waiting out its deployment timeout. Body is a small advisory
+//!     `{"reason":"<short deploy-step reason>"}` carrying **no secret** (never the
+//!     token, nonce, or join data); success is **202 Accepted**, same retry policy
+//!     as the inspection POST.
 //!
 //! ## TLS posture (§8)
 //! The root store holds *only* the delivered CA — [`RootCertStore::empty`] plus
@@ -102,6 +110,7 @@ pub struct CallbackClient {
     inspection_url: String,
     bootstrap_url: String,
     provisioned_url: String,
+    provision_failed_url: String,
     token: Secret,
 }
 
@@ -123,6 +132,11 @@ impl CallbackClient {
             inspection_url: inspection_url(&params.api, &params.namespace, &params.host),
             bootstrap_url: bootstrap_url(&params.api, &params.namespace, &params.host),
             provisioned_url: provisioned_url(&params.api, &params.namespace, &params.host),
+            provision_failed_url: provision_failed_url(
+                &params.api,
+                &params.namespace,
+                &params.host,
+            ),
             token: params.token.clone(),
         })
     }
@@ -192,11 +206,49 @@ impl CallbackClient {
         })
     }
 
+    /// POST the provision-failed callback when a deploy step fails after the host
+    /// has moved to Deploying (D-015 v4.1), so the controller fails the machine
+    /// promptly rather than waiting out its deployment timeout. Mirrors
+    /// [`provisioned`](Self::provisioned): the same bearer, 202 (any 2xx) treated as
+    /// success, transient transport/5xx failures retried with backoff. The body is a
+    /// small advisory `{"reason":<reason>}` — `reason` is a short, secret-free
+    /// deploy-step description that the caller controls; it is JSON-escaped via
+    /// [`provision_failed_body`] and **must never** carry the token, nonce, or join
+    /// data (§9).
+    pub fn provision_failed(&self, reason: &str) -> Result<(), ClientError> {
+        let body = provision_failed_body(reason)?;
+        let auth = self.bearer();
+        run_with_retries(MAX_ATTEMPTS, sleep, |_| {
+            let result = self
+                .agent
+                .post(&self.provision_failed_url)
+                .set("Authorization", &auth)
+                .set("Content-Type", "application/json")
+                .send_bytes(&body);
+            match classify_status(result) {
+                Ok(_resp) => Attempt::Done(()),
+                Err(verdict) => verdict.into_attempt(),
+            }
+        })
+    }
+
     /// The `Authorization` header value. Built only here, at the point of use —
     /// never logged or stored expanded (§9).
     fn bearer(&self) -> String {
         format!("Bearer {}", self.token.expose())
     }
+}
+
+/// Serialize the provision-failed body `{"reason":<reason>}`, JSON-escaping
+/// `reason` via serde so a quote, backslash, or control char in the reason cannot
+/// break the JSON or smuggle extra fields. `reason` is short and caller-controlled
+/// (a deploy-step description) and carries no secret (§9).
+fn provision_failed_body(reason: &str) -> Result<Vec<u8>, ClientError> {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        reason: &'a str,
+    }
+    serde_json::to_vec(&Body { reason }).map_err(|_| ClientError::Serialize)
 }
 
 /// A non-success classification of one HTTP attempt: either retry or stop. The
@@ -382,6 +434,16 @@ fn provisioned_url(api: &str, namespace: &str, host: &str) -> String {
     )
 }
 
+/// `{api}/api/v1/provision-failed/{ns}/{host}`, tolerating a trailing slash on `api`.
+fn provision_failed_url(api: &str, namespace: &str, host: &str) -> String {
+    format!(
+        "{}/api/v1/provision-failed/{}/{}",
+        api.trim_end_matches('/'),
+        namespace,
+        host
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +481,10 @@ mod tests {
             provisioned_url("https://h:8082", "ns", "node-1"),
             "https://h:8082/api/v1/provisioned/ns/node-1"
         );
+        assert_eq!(
+            provision_failed_url("https://h:8082", "ns", "node-1"),
+            "https://h:8082/api/v1/provision-failed/ns/node-1"
+        );
     }
 
     #[test]
@@ -431,11 +497,37 @@ mod tests {
             provisioned_url("https://h:8082/", "ns", "h"),
             "https://h:8082/api/v1/provisioned/ns/h"
         );
+        assert_eq!(
+            provision_failed_url("https://h:8082/", "ns", "h"),
+            "https://h:8082/api/v1/provision-failed/ns/h"
+        );
     }
 
     #[test]
     fn provisioned_body_is_the_fixed_advisory_json() {
         assert_eq!(PROVISIONED_BODY, br#"{"status":"provisioned"}"#);
+    }
+
+    #[test]
+    fn provision_failed_body_is_the_reason_json() {
+        assert_eq!(
+            provision_failed_body("image digest mismatch").unwrap(),
+            br#"{"reason":"image digest mismatch"}"#
+        );
+    }
+
+    #[test]
+    fn provision_failed_body_json_escapes_the_reason() {
+        // A reason with a quote/backslash/control char must be JSON-escaped so it
+        // cannot break out of the string or smuggle extra JSON fields.
+        let body = provision_failed_body("bad \"quote\" and \\slash\nnewline").unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"reason":"bad \"quote\" and \\slash\nnewline"}"#
+        );
+        // The escaped body round-trips back to the exact reason.
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["reason"], "bad \"quote\" and \\slash\nnewline");
     }
 
     #[test]
