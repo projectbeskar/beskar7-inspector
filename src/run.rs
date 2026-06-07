@@ -173,15 +173,24 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
     })?);
     eprintln!("beskar7-inspector: bootstrap data received, provisioning");
 
-    deploy::write_image(
-        &target,
-        &params.target,
-        &params.target_digest,
-        DEFAULT_MAX_IMAGE_BYTES,
-    )?;
-    deploy::reread_partition_table(&target)?;
-    let oem_partition = oem::find_oem_partition(&target)?;
-    deploy::inject_oem_config(&oem_partition, &user_data)?;
+    // The destructive deploy steps. The host has already moved to Deploying (the
+    // inspection POST succeeded), so a failure here is reported to the controller
+    // via the provision-failed callback (D-015 v4.1) — best-effort, before the
+    // existing abort/halt — so the controller fails the machine promptly instead of
+    // waiting out its deployment timeout.
+    if let Err(e) = run_deploy_steps(&target, &params, &user_data) {
+        let reason = deploy_failure_reason(&e);
+        if let Err(cb) = client.provision_failed(reason) {
+            // Best-effort: a failed callback (after its own retries) must NOT loop
+            // or mask the deploy error — log the non-secret callback error and fall
+            // through to propagating the original deploy failure (which parks PID 1
+            // so the controller still times the host out).
+            eprintln!("beskar7-inspector: provision-failed callback did not land: {cb}");
+        } else {
+            eprintln!("beskar7-inspector: provision-failed callback accepted ({reason})");
+        }
+        return Err(e);
+    }
 
     // Zero the join secret before handing control to the firmware (§9.1 step 6).
     // The provisioned callback below carries no secret, so it is safe to fire
@@ -199,6 +208,81 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
 
     eprintln!("beskar7-inspector: provisioned, rebooting into the target OS");
     Err(RunError::Deploy(deploy::reboot_now()))
+}
+
+/// Run the destructive deploy steps in order — write the digest-pinned image,
+/// re-read the partition table, locate `COS_OEM`, inject the per-host config — each
+/// gated by the one before (§9.1 step 5). Returns the first failing step's
+/// [`RunError`]; the caller fires the provision-failed callback for it. Kept
+/// separate from [`run`] so the deploy-step error path has a single funnel for the
+/// callback.
+fn run_deploy_steps(
+    target: &crate::target_disk::TargetDisk,
+    params: &BootParams,
+    user_data: &[u8],
+) -> Result<(), RunError> {
+    deploy::write_image(
+        target,
+        &params.target,
+        &params.target_digest,
+        DEFAULT_MAX_IMAGE_BYTES,
+    )?;
+    deploy::reread_partition_table(target)?;
+    let oem_partition = oem::find_oem_partition(target)?;
+    deploy::inject_oem_config(&oem_partition, user_data)?;
+    Ok(())
+}
+
+/// A short, secret-free reason string for the provision-failed callback, derived
+/// from which deploy step failed. The strings name the failing step only — never
+/// the image bytes, the join secret, device paths, or status codes — so they are
+/// safe to put on the wire and in a log (§9). `&'static str` because the controller
+/// uses the reason for operator-facing diagnosis, not machine parsing.
+fn deploy_failure_reason(e: &RunError) -> &'static str {
+    match e {
+        RunError::Deploy(d) => deploy_error_reason(d),
+        // find_oem_partition failed — the freshly-written image had no locatable
+        // COS_OEM partition to inject into.
+        RunError::Oem(_) => "COS_OEM partition not found",
+        // run_deploy_steps only surfaces Deploy/Oem errors, but keep the match total
+        // so a future step added there cannot silently fall through without a reason.
+        _ => "deploy failed",
+    }
+}
+
+/// Map a [`DeployError`] to its short, secret-free callback reason (§9). Groups the
+/// step's variants: image fetch/digest, whole-disk write/identity, partition
+/// re-read, and `COS_OEM` mount/inject.
+fn deploy_error_reason(e: &DeployError) -> &'static str {
+    use crate::image::ImageError;
+    match e {
+        DeployError::Image(ImageError::DigestMismatch { .. }) => "image digest mismatch",
+        DeployError::Image(ImageError::InvalidDigestFormat) => "invalid image digest",
+        DeployError::Image(ImageError::UnsupportedScheme) => "unsupported image URL scheme",
+        DeployError::Image(ImageError::TooLarge { .. }) => "image too large",
+        DeployError::Image(
+            ImageError::Http(_) | ImageError::Transport(_) | ImageError::Read(_),
+        ) => "image fetch failed",
+        DeployError::Image(ImageError::TlsSetup) => "image fetch failed",
+        DeployError::Image(ImageError::Write(_)) | DeployError::Sync(_) => {
+            "whole-disk write failed"
+        }
+        DeployError::OpenTarget { .. }
+        | DeployError::NotABlockDevice { .. }
+        | DeployError::Stat { .. }
+        | DeployError::NoDeviceNumber { .. }
+        | DeployError::DeviceIdentityMismatch { .. }
+        | DeployError::BadDeviceNumber { .. } => "target disk error",
+        DeployError::Reread { .. } => "partition re-read failed",
+        DeployError::Mountpoint { .. }
+        | DeployError::MakeNode { .. }
+        | DeployError::Mount { .. }
+        | DeployError::ConfigWrite(_)
+        | DeployError::Unmount { .. } => "COS_OEM inject failed",
+        // reboot_now's error never flows through run_deploy_steps (it runs after a
+        // successful deploy), but keep the match total.
+        DeployError::Reboot(_) => "deploy failed",
+    }
 }
 
 /// `mlockall(MCL_CURRENT|MCL_FUTURE)` so no page — including the heap holding the
@@ -454,6 +538,67 @@ mod tests {
         for (_, mp, _, flags) in specs {
             assert!(flags.contains(MsFlags::MS_NOSUID), "{mp} should be nosuid");
             assert!(flags.contains(MsFlags::MS_NOEXEC), "{mp} should be noexec");
+        }
+    }
+
+    #[test]
+    fn deploy_reason_names_the_failing_step_without_secrets() {
+        use crate::image::ImageError;
+
+        // Image-stage failures map to image-specific reasons.
+        assert_eq!(
+            deploy_error_reason(&DeployError::Image(ImageError::DigestMismatch {
+                expected: "sha256:aa".into(),
+                computed: "sha256:bb".into(),
+            })),
+            "image digest mismatch"
+        );
+        assert_eq!(
+            deploy_error_reason(&DeployError::Image(ImageError::TooLarge { max_bytes: 1 })),
+            "image too large"
+        );
+        assert_eq!(
+            deploy_error_reason(&DeployError::Image(ImageError::Http(500))),
+            "image fetch failed"
+        );
+        // The whole-disk write (image write to the sink, or the flush).
+        assert_eq!(
+            deploy_error_reason(&DeployError::Sync(std::io::Error::other("x"))),
+            "whole-disk write failed"
+        );
+        // Partition re-read.
+        assert_eq!(
+            deploy_error_reason(&DeployError::Reread {
+                path: "/dev/sda".into(),
+                source: nix::errno::Errno::EIO,
+            }),
+            "partition re-read failed"
+        );
+        // COS_OEM inject — the ConfigWrite source is an IO error only, never the
+        // join secret, and the reason names the step, not the contents.
+        assert_eq!(
+            deploy_error_reason(&DeployError::ConfigWrite(std::io::Error::other("x"))),
+            "COS_OEM inject failed"
+        );
+
+        // The Oem (find-partition) error path has its own reason.
+        assert_eq!(
+            deploy_failure_reason(&RunError::Oem(crate::oem::OemError::NotFound {
+                disk: "nvme0n1".into(),
+            })),
+            "COS_OEM partition not found"
+        );
+
+        // Every reason is short and contains no obvious secret marker. (A static
+        // smoke check — the real guarantee is that the strings are fixed literals.)
+        for r in [
+            deploy_error_reason(&DeployError::Sync(std::io::Error::other("x"))),
+            deploy_failure_reason(&RunError::Oem(crate::oem::OemError::NotFound {
+                disk: "nvme0n1".into(),
+            })),
+        ] {
+            assert!(r.len() < 64, "reason {r:?} should be short");
+            assert!(!r.contains("Bearer"), "reason {r:?} must not name a token");
         }
     }
 

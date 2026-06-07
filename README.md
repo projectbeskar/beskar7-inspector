@@ -10,7 +10,7 @@ its hardware natively, reports to the Beskar7 controller, then writes the target
 OS image to disk and reboots into it. There is no shell, no busybox, and no
 external tools — every probe and provisioning syscall is performed in-process.
 
-## How it works (contract v4)
+## How it works (contract v4.1)
 
 Beskar7 renders a per-host iPXE script that boots this image with the `beskar7.*`
 parameters on the kernel cmdline. The inspector then runs two phases:
@@ -36,7 +36,7 @@ The wire contract — endpoints, cmdline parameters, the report schema, the
 digest-pinning trust model, and the disk/`COS_OEM` behavior — is specified in
 [`docs/inspector-contract.md`](https://github.com/projectbeskar/beskar7/blob/main/docs/inspector-contract.md)
 in the beskar7 repo (the **source of truth**). This repo implements contract
-**v4** (`CONTRACT_VERSION` in `src/lib.rs`).
+**v4.1** (`CONTRACT_VERSION` in `src/lib.rs`).
 
 ## Security posture
 
@@ -69,8 +69,8 @@ minimal initramfs (the binary as `/init` plus the mountpoints it needs), and
 takes the kernel from Alpine's `linux-lts`. An operator serves these two files to
 the boot infrastructure the controller's iPXE script points at.
 
-> **Status:** the inspector is feature-complete against contract v4 (incl. the
-> provisioning-complete callback) and validated end-to-end on real bare metal; fully unit-
+> **Status:** the inspector is feature-complete against contract v4.1 (incl. the
+> provisioning-complete and provision-failed callbacks) and validated end-to-end on real bare metal; fully unit-
 > and contract-tested. End-to-end boot on real firmware (PXE → inspect → provision
 > → reboot) is validated as part of Beskar7's integration/e2e work, not in this
 > repo's CI (which runs fmt, clippy, and tests).
