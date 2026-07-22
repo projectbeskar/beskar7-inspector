@@ -15,7 +15,7 @@
 //! write the digest-pinned image to the disk             deploy::write_image
 //! re-read the partition table                           deploy::reread_partition_table
 //! locate COS_OEM on the target disk                     oem::find_oem_partition
-//! mount COS_OEM, inject 99_beskar7.yaml, unmount        deploy::inject_oem_config
+//! mount COS_OEM, inject 99_beskar7.yaml + provider-id   deploy::inject_oem_config
 //! zero the user-data buffer                             drop(user_data)
 //! POST the provisioned-complete callback (202)          client::provisioned
 //! reboot(2)                                             deploy::reboot_now
@@ -229,7 +229,7 @@ fn run_deploy_steps(
     )?;
     deploy::reread_partition_table(target)?;
     let oem_partition = oem::find_oem_partition(target)?;
-    deploy::inject_oem_config(&oem_partition, user_data)?;
+    deploy::inject_oem_config(&oem_partition, user_data, &params.provider_id)?;
     Ok(())
 }
 
@@ -278,6 +278,7 @@ fn deploy_error_reason(e: &DeployError) -> &'static str {
         | DeployError::MakeNode { .. }
         | DeployError::Mount { .. }
         | DeployError::ConfigWrite(_)
+        | DeployError::ProviderIdWrite(_)
         | DeployError::Unmount { .. } => "COS_OEM inject failed",
         // reboot_now's error never flows through run_deploy_steps (it runs after a
         // successful deploy), but keep the match total.
