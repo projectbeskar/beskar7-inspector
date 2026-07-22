@@ -9,10 +9,11 @@
 //!   2. [`reread_partition_table`] (§9.1 5.3) — `BLKRRPART` so the freshly-written
 //!      image's partitions appear; the caller then locates `COS_OEM`
 //!      ([`crate::oem`]).
-//!   3. [`inject_oem_config`] (§9.1 5.3) — mount the `COS_OEM` partition
+//!   3. [`inject_oem_config`] (§9.1 5.3–5.4) — mount the `COS_OEM` partition
 //!      (`nodev,nosuid,noexec`), write the per-host Kairos cloud-config
-//!      (`99_beskar7.yaml`, carrying the CAPI join secret) `0600`/root, `fsync`
-//!      file + directory, and unmount.
+//!      (`99_beskar7.yaml`, carrying the CAPI join secret) and the P2 provider-id
+//!      artifact (`beskar7/provider-id`, `b7://<ns>/<host>` verbatim) — both
+//!      `0600`/root — `fsync` files + directories, and unmount.
 //!   4. [`reboot_now`] (§9.1 5.4) — `reboot(2)` into the provisioned OS.
 //!
 //! ## Identity, never a re-resolvable path (TOCTOU guard, §5 / §9.1 5.3)
@@ -41,7 +42,8 @@
 //! success or failure (falling back to a lazy `MNT_DETACH` if the eager unmount is
 //! busy) — so the partition is never left mounted across a reboot or a drop to a
 //! debug shell. On an inject failure it first removes the partial `99_beskar7.yaml`
-//! (which may hold the join secret) and *then* unmounts. (Unlinking the partial
+//! (which may hold the join secret) and the partial `beskar7/provider-id`, and
+//! *then* unmounts (§9.1 step 8). (Unlinking the partial
 //! frees but does not wipe its ext blocks on the target disk; that freed-block
 //! remanence is accepted — the secret lives on this disk by design, and the disk
 //! is unbootable until the next attempt overwrites the whole device.)
@@ -72,6 +74,15 @@ use crate::target_disk::TargetDisk;
 /// The per-host Kairos cloud-config filename injected into `COS_OEM`. The `99_`
 /// prefix orders it after the image's baked-in OEM configs so it wins (§9.1 5.3).
 const OEM_CONFIG_FILENAME: &str = "99_beskar7.yaml";
+/// Subdirectory of the `COS_OEM` mount root holding the P2 provider-id artifact
+/// (contract §9.1 5.4). Together with [`OEM_PROVIDER_ID_FILENAME`] this is the
+/// mount-relative path `beskar7/provider-id`, which is `/oem/beskar7/provider-id`
+/// once Kairos mounts `COS_OEM` at `/oem` on the provisioned OS.
+const OEM_PROVIDER_ID_SUBDIR: &str = "beskar7";
+/// The P2 provider-id artifact filename (contract §9.1 5.4). Holds the
+/// `beskar7.provider-id` value (`b7://<ns>/<host>`) verbatim, so a *shared*
+/// bootstrap stage can read a *per-host* kubelet `--provider-id` (D-014 P2).
+const OEM_PROVIDER_ID_FILENAME: &str = "provider-id";
 /// Private mountpoint for the `COS_OEM` partition during injection. Created and
 /// removed by [`inject_oem_config`]; on a fresh boot nothing else uses it.
 const OEM_MOUNTPOINT: &str = "/run/beskar7-oem";
@@ -188,6 +199,11 @@ pub enum DeployError {
     /// I/O error only — it never contains the config contents (the join secret).
     #[error("writing the per-host COS_OEM config")]
     ConfigWrite(#[source] std::io::Error),
+    /// Writing or flushing the P2 `beskar7/provider-id` artifact failed (§9.1 5.4).
+    /// The value is non-secret (`b7://<ns>/<host>`), but the source is kept to an
+    /// I/O error for symmetry with [`ConfigWrite`](Self::ConfigWrite).
+    #[error("writing the COS_OEM provider-id artifact")]
+    ProviderIdWrite(#[source] std::io::Error),
     /// Unmounting `COS_OEM` failed.
     #[error("unmounting COS_OEM at {path}")]
     Unmount {
@@ -324,8 +340,9 @@ pub fn reread_partition_table(target: &TargetDisk) -> Result<(), DeployError> {
 }
 
 /// Mount the located `COS_OEM` partition, write the per-host Kairos cloud-config
-/// (`99_beskar7.yaml`, carrying `user_data` — the CAPI join secret) into it, and
-/// unmount (contract §9.1 5.3–5.5).
+/// (`99_beskar7.yaml`, carrying `user_data` — the CAPI join secret) and the P2
+/// provider-id artifact (`beskar7/provider-id`, `provider_id` verbatim) into it,
+/// and unmount (contract §9.1 5.3–5.5).
 ///
 /// The mount is bound to the partition's **enumerated `major:minor`** (finding
 /// H1 / §9.1 5.3 parentage check): rather than mounting a `/dev/<kname>` path that
@@ -333,11 +350,17 @@ pub fn reread_partition_table(target: &TargetDisk) -> Result<(), DeployError> {
 /// node from `oem.dev_number` and mounts *that* — so the device mounted is provably
 /// the partition [`crate::oem`] enumerated on the target disk. `COS_OEM` is
 /// **always unmounted before returning** — on success or failure — with the partial
-/// config removed first on failure (finding H2).
+/// artifacts removed first on failure (finding H2 / §9.1 step 8).
 ///
 /// `user_data` is the join secret: it is written only to the `0600`/root file and
-/// is never logged. The caller zeroes its buffer after this returns.
-pub fn inject_oem_config(oem: &OemPartition, user_data: &[u8]) -> Result<(), DeployError> {
+/// is never logged. `provider_id` (`b7://<ns>/<host>`) is non-secret and written
+/// `0600`/root in the same mount session — no extra mount or fetch (§9.1 5.4). The
+/// caller zeroes its `user_data` buffer after this returns.
+pub fn inject_oem_config(
+    oem: &OemPartition,
+    user_data: &[u8],
+    provider_id: &str,
+) -> Result<(), DeployError> {
     let dev = oem.dev_path();
     let devnum = parse_dev_number(&oem.dev_number)
         .ok_or_else(|| DeployError::BadDeviceNumber { dev: dev.clone() })?;
@@ -362,15 +385,21 @@ pub fn inject_oem_config(oem: &OemPartition, user_data: &[u8]) -> Result<(), Dep
         source,
     })?;
 
-    let result = mount_inject_unmount(node, user_data, &dev);
+    let result = mount_inject_unmount(node, user_data, provider_id, &dev);
     let _ = fs::remove_file(node); // remove the private node after the mount lifetime
     result
 }
 
 /// The mount → write → unmount core, factored out so [`inject_oem_config`] always
 /// removes the private device node afterward. Mounts `node` (`nodev,nosuid,noexec`),
-/// writes the config, and **always unmounts before returning** (finding H2).
-fn mount_inject_unmount(node: &Path, user_data: &[u8], dev: &str) -> Result<(), DeployError> {
+/// writes both `COS_OEM` artifacts, and **always unmounts before returning** (finding
+/// H2).
+fn mount_inject_unmount(
+    node: &Path,
+    user_data: &[u8],
+    provider_id: &str,
+    dev: &str,
+) -> Result<(), DeployError> {
     let mnt = Path::new(OEM_MOUNTPOINT);
     fs::create_dir_all(mnt).map_err(|source| DeployError::Mountpoint {
         path: OEM_MOUNTPOINT.to_string(),
@@ -388,11 +417,18 @@ fn mount_inject_unmount(node: &Path, user_data: &[u8], dev: &str) -> Result<(), 
         });
     }
 
-    // Write the config. On failure, remove the partial file (it may hold the join
-    // secret) BEFORE unmounting (finding H2).
-    let inject = write_and_sync_config(mnt, user_data);
+    // Write both artifacts in this one mount session: 99_beskar7.yaml (the join
+    // secret) then beskar7/provider-id (v4.2, §9.1 5.4). On failure, remove both
+    // partials — the config may hold the join secret — BEFORE unmounting (finding
+    // H2 / §9.1 step 8). remove_file on a never-created path is a harmless no-op.
+    let inject = write_and_sync_config(mnt, user_data)
+        .and_then(|()| write_and_sync_provider_id(mnt, provider_id));
     if inject.is_err() {
         let _ = fs::remove_file(mnt.join(OEM_CONFIG_FILENAME));
+        let _ = fs::remove_file(
+            mnt.join(OEM_PROVIDER_ID_SUBDIR)
+                .join(OEM_PROVIDER_ID_FILENAME),
+        );
     }
 
     // Always unmount before returning — COS_OEM is never left mounted across a
@@ -452,6 +488,45 @@ fn write_and_sync_config(mount_dir: &Path, contents: &[u8]) -> Result<(), Deploy
     // fsync the directory so the new dirent survives the unmount/reboot.
     let dir = File::open(mount_dir).map_err(DeployError::ConfigWrite)?;
     dir.sync_all().map_err(DeployError::ConfigWrite)?;
+    Ok(())
+}
+
+/// Write `provider_id` verbatim — **no trailing newline** — to
+/// `<mount_dir>/beskar7/provider-id`, force mode `0600`, and `fsync` the file, its
+/// `beskar7/` directory, and the mount root (so the new subdirectory's dirent is
+/// durable) before the unmount/reboot (contract §9.1 5.4). The value is the
+/// `beskar7.provider-id` cmdline param (`b7://<ns>/<host>`): non-secret, but written
+/// `0600`/root to mirror the config's hygiene. A *shared* bootstrap stage reads
+/// exactly these bytes to set a *per-host* kubelet `--provider-id` (D-014 P2), so a
+/// trailing newline or wrong mode would corrupt a downstream consumer — the byte
+/// exactness is pinned against the shared golden artifact fixture. Pure file I/O
+/// over an injected directory, so it is unit-tested against a scratch dir without a
+/// real mount.
+fn write_and_sync_provider_id(mount_dir: &Path, provider_id: &str) -> Result<(), DeployError> {
+    let dir = mount_dir.join(OEM_PROVIDER_ID_SUBDIR);
+    fs::create_dir_all(&dir).map_err(DeployError::ProviderIdWrite)?;
+    let path = dir.join(OEM_PROVIDER_ID_FILENAME);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(DeployError::ProviderIdWrite)?;
+    // Force exactly 0600 regardless of the inherited umask.
+    file.set_permissions(Permissions::from_mode(0o600))
+        .map_err(DeployError::ProviderIdWrite)?;
+    // Verbatim: exactly the cmdline bytes, no trailing newline — a shared bootstrap
+    // stage consumes this as the literal ProviderID (§9.1 5.4).
+    file.write_all(provider_id.as_bytes())
+        .map_err(DeployError::ProviderIdWrite)?;
+    file.sync_all().map_err(DeployError::ProviderIdWrite)?;
+    // fsync the beskar7/ directory, then the mount root, so both the file and the
+    // freshly-created subdirectory's dirent survive the unmount/reboot.
+    let dirf = File::open(&dir).map_err(DeployError::ProviderIdWrite)?;
+    dirf.sync_all().map_err(DeployError::ProviderIdWrite)?;
+    let rootf = File::open(mount_dir).map_err(DeployError::ProviderIdWrite)?;
+    rootf.sync_all().map_err(DeployError::ProviderIdWrite)?;
     Ok(())
 }
 
@@ -593,6 +668,72 @@ mod tests {
     fn config_filename_is_the_contract_numbered_name() {
         // The 99_ prefix orders it after the image's baked-in OEM configs (§9.1 5.3).
         assert_eq!(OEM_CONFIG_FILENAME, "99_beskar7.yaml");
+    }
+
+    #[test]
+    fn write_and_sync_provider_id_matches_golden_artifact() {
+        // Byte-pin the P2 write against the shared golden fixture (§9.1 5.4):
+        // content verbatim, NO trailing newline, mode 0600, at the mount-relative
+        // path the fixture's absolute artifactPath implies.
+        const GOLDEN: &str = include_str!("../test/contract/golden_provider_id_artifact.json");
+        let g: serde_json::Value = serde_json::from_str(GOLDEN).expect("golden artifact decodes");
+
+        let content = g["content"].as_str().expect("golden content");
+        let artifact_path = g["artifactPath"].as_str().expect("golden artifactPath");
+        assert_eq!(g["mode"].as_str(), Some("0600"), "golden mode is 0600");
+        assert_eq!(g["owner"].as_str(), Some("root"), "golden owner is root");
+        assert_eq!(
+            g["contentHasTrailingNewline"].as_bool(),
+            Some(false),
+            "golden asserts no trailing newline"
+        );
+
+        // The fixture path is absolute (`/oem/<relpath>`) — the eventual mountpoint;
+        // our write is relative to the COS_OEM mount root, so strip `/oem/` and
+        // confirm the module composes exactly that relative path.
+        let relpath = artifact_path
+            .strip_prefix("/oem/")
+            .expect("artifactPath is under /oem/");
+        assert_eq!(
+            relpath,
+            format!("{OEM_PROVIDER_ID_SUBDIR}/{OEM_PROVIDER_ID_FILENAME}"),
+            "the write path must match the golden artifactPath"
+        );
+
+        let s = crate::probe::testutil::Scratch::new("oem-pid");
+        write_and_sync_provider_id(s.path(), content).expect("provider-id written");
+
+        let path = s
+            .path()
+            .join(OEM_PROVIDER_ID_SUBDIR)
+            .join(OEM_PROVIDER_ID_FILENAME);
+        let meta = std::fs::metadata(&path).expect("file exists");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "the provider-id artifact must be 0600"
+        );
+        // Raw byte read (never a String compare that could normalize a newline).
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, content.as_bytes(), "content byte-verbatim");
+        assert_ne!(
+            bytes.last(),
+            Some(&b'\n'),
+            "the provider-id artifact must have NO trailing newline"
+        );
+    }
+
+    #[test]
+    fn write_and_sync_provider_id_truncates_a_previous_file() {
+        // A retry must not leave stale trailing bytes from a longer prior write.
+        let s = crate::probe::testutil::Scratch::new("oem-pid-trunc");
+        write_and_sync_provider_id(s.path(), "b7://ns/a-much-longer-host-name").unwrap();
+        write_and_sync_provider_id(s.path(), "b7://n/h").unwrap();
+        let path = s
+            .path()
+            .join(OEM_PROVIDER_ID_SUBDIR)
+            .join(OEM_PROVIDER_ID_FILENAME);
+        assert_eq!(std::fs::read(&path).unwrap(), b"b7://n/h");
     }
 
     #[test]

@@ -1,25 +1,38 @@
-# Contract fixtures
+# Contract fixtures (vendored — contract `v4.2`)
 
-`golden_inspection_report.json` is the canonical inspection report from the
-Beskar7 controller↔inspector contract (`docs/inspector-contract.md` in the
-[beskar7](https://github.com/projectbeskar/beskar7) repo, **contract `v1`**,
-§6).
+These files are **byte-copies** of the canonical wire-contract fixtures in the
+[beskar7](https://github.com/projectbeskar/beskar7) repo
+(`test/contract/*`, spec: `docs/inspector-contract.md`). **beskar7 is the single
+source of truth**; this inspector never edits them by hand — it vendors them and
+pins the immutable beskar7 git tag they were taken from.
 
-## Dual-repo anti-drift
+| File | What it is |
+|---|---|
+| `VERSION` | the one-line contract version marker (`v4.2`); the Rust `CONTRACT_VERSION` must equal its trimmed value |
+| `CONTRACT_REF` | the pinned beskar7 tag (`contract/v4.2`) the copies were taken from — the ref the CI drift job fetches |
+| `golden_inspection_report.json` | the inspection-report POST body the inspector produces (§6) |
+| `golden_boot_cmdline.txt` | the byte-exact iPXE `/boot` render, incl. `beskar7.provider-id` (v4.2 deploy-path, §5/§9.1) |
+| `golden_provider_id_artifact.json` | descriptor of the `/oem/beskar7/provider-id` `COS_OEM` artifact the inspector writes (v4.2, §9.1 5.4) |
 
-This file is **byte-identical** to its counterpart in the beskar7 repo at
-`test/contract/golden_inspection_report.json`. The two copies are the shared
-guard against the producer (this inspector) and the consumer (the controller)
-drifting apart:
+## Dual-repo anti-drift (Option D)
 
-| Repo | Test | Asserts |
-|---|---|---|
-| beskar7-inspector | `tests/contract.rs` | the report serde types decode this fixture strictly (`deny_unknown_fields`), round-trip it losslessly, and emit the controller-expected aggregates |
-| beskar7 | `controllers/inspection_contract_test.go` | the same bytes decode into `InspectionReportRequest`, round-trip, run `buildInspectionReport`, and pass the hardware-requirement validation (`parseMemoryCapacityGB`) |
+The vendored copies are the shared guard against the producer (this inspector)
+and the consumer (the controller) drifting apart. Two mechanisms enforce it:
 
-A schema change must update **both** copies in lockstep and bump the contract
-version in `docs/inspector-contract.md`. Changing one side alone fails one of
-the two suites.
+- **CI `contract-sync` job** (`.github/workflows/ci.yml`) — fetches beskar7's
+  canonical files at `CONTRACT_REF` and `diff`s each against the vendored copy;
+  any single-byte delta fails. It also re-asserts `CONTRACT_VERSION == VERSION`.
+  This is the only step that reaches across repos.
+- **Behavioral tests** — run purely against these vendored copies (no network):
+
+  | Repo | Test | Asserts |
+  |---|---|---|
+  | beskar7-inspector | `tests/contract.rs`, `src/{cmdline,deploy}.rs` | the report round-trips losslessly and emits the expected aggregates; `beskar7.provider-id` parses from the golden cmdline; the `provider-id` artifact is written 0600/root, no trailing newline, matching the golden artifact; `CONTRACT_VERSION == VERSION.trim()` |
+  | beskar7 | `controllers/*_contract_test.go` | the same bytes decode into the Go types, round-trip, and the renders match `buildBootIPXEScript`/`providerID()` |
+
+Adopting a new contract version means bumping `CONTRACT_REF` + `VERSION` and
+re-vendoring every file here in one change; a schema change alone (without the
+matching beskar7 tag) is caught by the failing `contract-sync` diff.
 
 ## Canonical aggregates
 

@@ -39,3 +39,50 @@ jobs:
 
       - name: Test (unit + contract)
         run: cargo test --all-targets --verbose
+
+  # The cross-repo drift gate (GA-CONTRACT-SYNC Option D, §3.3). beskar7 is the
+  # single source of truth for the shared wire-contract fixtures; this repo vendors
+  # byte-copies under test/contract/ and pins the immutable beskar7 tag they were
+  # taken from in test/contract/CONTRACT_REF. This job fetches beskar7's canonical
+  # files at that tag and fails on any byte drift. It is the ONLY step that reaches
+  # across repos — the Rust behavioral/contract tests above run purely against the
+  # vendored copies, so a GitHub outage degrades only this diff, never the suite.
+  contract-sync:
+    name: contract-sync (drift vs beskar7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Resolve the pinned contract ref
+        id: pin
+        # Command substitution strips the trailing newline. Adopting a new contract
+        # version means editing this file and re-vendoring test/contract/* together.
+        run: echo "ref=$(cat test/contract/CONTRACT_REF)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch beskar7 canonical fixtures at the pinned tag
+        # Shallow clone of the single immutable contract/<version> tag: reproducible,
+        # cacheable, and it never races beskar7's main branch.
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.pin.outputs.ref }}" \
+            https://github.com/projectbeskar/beskar7 beskar7-upstream
+
+      - name: Diff vendored fixtures against beskar7 (byte-exact; any delta fails)
+        run: |
+          set -euo pipefail
+          for f in VERSION golden_inspection_report.json golden_boot_cmdline.txt golden_provider_id_artifact.json; do
+            echo "::group::diff $f"
+            diff "beskar7-upstream/test/contract/$f" "test/contract/$f"
+            echo "::endgroup::"
+          done
+          echo "vendored fixtures are byte-identical to ${{ steps.pin.outputs.ref }}"
+
+      - name: Assert Rust CONTRACT_VERSION == vendored VERSION
+        # Cheap, network-free shell mirror of the Rust contract test — the drift job
+        # must not go green while the const and the vendored marker disagree.
+        run: |
+          set -euo pipefail
+          vendored="$(tr -d '[:space:]' < test/contract/VERSION)"
+          rust="$(grep -oP 'CONTRACT_VERSION: &str = "\K[^"]+' src/lib.rs)"
+          echo "vendored=${vendored} rust=${rust}"
+          test "${vendored}" = "${rust}"

@@ -44,6 +44,15 @@ pub struct BootParams {
     /// the image fetcher's responsibility (§8.1), mirroring how
     /// [`ca`](Self::ca) defers decoding to the TLS client. Non-secret.
     pub target_digest: String,
+    /// `beskar7.provider-id` — the per-host CAPI ProviderID, always rendered by the
+    /// controller in the form `b7://<namespace>/<host>` (contract §5, v4.2). The
+    /// inspector writes it verbatim to `/oem/beskar7/provider-id` on the target's
+    /// `COS_OEM` partition during the same mount session as `99_beskar7.yaml`
+    /// ([`crate::deploy::inject_oem_config`], §9.1 5.4), so a *shared* bootstrap
+    /// template can derive a *per-host* kubelet `--provider-id` (D-014 P2). Required
+    /// and non-empty, like [`target_digest`](Self::target_digest); kept as the raw
+    /// string here (the deploy step writes the bytes as-is). Non-secret.
+    pub provider_id: String,
     /// `beskar7.ca` — base64-encoded PEM of the CA used to verify the callback's
     /// TLS certificate. Kept as the raw base64 string; decoding and validation
     /// are the TLS client's responsibility (§8). Non-secret (a public CA cert).
@@ -114,6 +123,7 @@ impl BootParams {
         let mut token = None;
         let mut target = None;
         let mut target_digest = None;
+        let mut provider_id = None;
         let mut ca = None;
         let mut disk = None;
         let mut bootif = None;
@@ -134,6 +144,7 @@ impl BootParams {
                 "beskar7.token" => token = non_empty(value),
                 "beskar7.target" => target = non_empty(value),
                 "beskar7.target-digest" => target_digest = non_empty(value),
+                "beskar7.provider-id" => provider_id = non_empty(value),
                 "beskar7.ca" => ca = non_empty(value),
                 "beskar7.disk" => disk = non_empty(value),
                 // The pxelinux/iPXE netboot convention (not a beskar7.* key).
@@ -162,6 +173,7 @@ impl BootParams {
             ("beskar7.token", token.is_some()),
             ("beskar7.target", target.is_some()),
             ("beskar7.target-digest", target_digest.is_some()),
+            ("beskar7.provider-id", provider_id.is_some()),
             ("beskar7.ca", ca.is_some()),
         ] {
             if !present {
@@ -180,6 +192,7 @@ impl BootParams {
             token: Secret::new(token.expect("token present")),
             target: target.expect("target present"),
             target_digest: target_digest.expect("target_digest present"),
+            provider_id: provider_id.expect("provider_id present"),
             ca: ca.expect("ca present"),
             disk,
             bootif,
@@ -218,6 +231,7 @@ mod tests {
         beskar7.token=Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2RlZmdoaWprbA \
         beskar7.target=https://images.example.com/kairos-v3-amd64.raw \
         beskar7.target-digest=sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 \
+        beskar7.provider-id=b7://tenant-a/node-01 \
         beskar7.ca=LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg== \
         beskar7.timeout=600 beskar7.debug=true console=ttyS0,115200n8 quiet";
 
@@ -225,7 +239,7 @@ mod tests {
         format!(
             "beskar7.api=https://h:8082 beskar7.namespace=ns beskar7.host=h \
              beskar7.token=tok beskar7.target=https://t beskar7.target-digest={DIGEST} \
-             beskar7.ca=Zm9v"
+             beskar7.provider-id=b7://ns/h beskar7.ca=Zm9v"
         )
     }
 
@@ -241,6 +255,7 @@ mod tests {
         );
         assert_eq!(p.target, "https://images.example.com/kairos-v3-amd64.raw");
         assert_eq!(p.target_digest, DIGEST);
+        assert_eq!(p.provider_id, "b7://tenant-a/node-01");
         assert_eq!(p.ca, "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==");
         assert_eq!(p.timeout, Some(Duration::from_secs(600)));
         assert!(p.debug);
@@ -314,7 +329,7 @@ mod tests {
         let line = format!(
             "beskar7.api=https://h beskar7.namespace=n beskar7.host=h \
             beskar7.token=t beskar7.target=https://t beskar7.target-digest={DIGEST} \
-            beskar7.ca=YWJjZGVmZ2hpamts=="
+            beskar7.provider-id=b7://n/h beskar7.ca=YWJjZGVmZ2hpamts=="
         );
         let p = BootParams::parse(&line).expect("valid");
         assert_eq!(p.ca, "YWJjZGVmZ2hpamts==");
@@ -325,13 +340,15 @@ mod tests {
         // Everything present except the token.
         let line = format!(
             "beskar7.api=https://h beskar7.namespace=n beskar7.host=h \
-            beskar7.target=https://t beskar7.target-digest={DIGEST} beskar7.ca=Zm9v"
+            beskar7.target=https://t beskar7.target-digest={DIGEST} \
+            beskar7.provider-id=b7://n/h beskar7.ca=Zm9v"
         );
         match BootParams::parse(&line).unwrap_err() {
             CmdlineError::MissingRequired(names) => {
                 assert!(names.contains("beskar7.token"), "names: {names}");
                 assert!(!names.contains("beskar7.api"));
                 assert!(!names.contains("beskar7.target-digest"), "names: {names}");
+                assert!(!names.contains("beskar7.provider-id"), "names: {names}");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -341,10 +358,29 @@ mod tests {
     fn missing_target_digest_is_named() {
         // The v2 param: present-but-required check fires when it is absent.
         let line = "beskar7.api=https://h beskar7.namespace=n beskar7.host=h \
-            beskar7.token=t beskar7.target=https://t beskar7.ca=Zm9v"; // no target-digest
+            beskar7.token=t beskar7.target=https://t beskar7.provider-id=b7://n/h \
+            beskar7.ca=Zm9v"; // no target-digest
         match BootParams::parse(line).unwrap_err() {
             CmdlineError::MissingRequired(names) => {
                 assert!(names.contains("beskar7.target-digest"), "names: {names}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_provider_id_is_named() {
+        // The v4.2 param: the present-but-required check fires when it is absent, so
+        // a v4.1 controller's cmdline (no provider-id) is rejected by a v4.2 inspector.
+        let line = format!(
+            "beskar7.api=https://h beskar7.namespace=n beskar7.host=h \
+            beskar7.token=t beskar7.target=https://t beskar7.target-digest={DIGEST} \
+            beskar7.ca=Zm9v" // no provider-id
+        );
+        match BootParams::parse(&line).unwrap_err() {
+            CmdlineError::MissingRequired(names) => {
+                assert!(names.contains("beskar7.provider-id"), "names: {names}");
+                assert!(!names.contains("beskar7.target-digest"), "names: {names}");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -361,6 +397,7 @@ mod tests {
             "beskar7.token",
             "beskar7.target",
             "beskar7.target-digest",
+            "beskar7.provider-id",
             "beskar7.ca",
         ] {
             assert!(msg.contains(key), "{key} not reported in {msg:?}");
@@ -372,7 +409,7 @@ mod tests {
         let line = format!(
             "beskar7.api=https://h beskar7.namespace=n beskar7.host=h \
             beskar7.token= beskar7.target=https://t beskar7.target-digest={DIGEST} \
-            beskar7.ca=Zm9v"
+            beskar7.provider-id=b7://n/h beskar7.ca=Zm9v"
         ); // empty token
         let err = BootParams::parse(&line).unwrap_err();
         assert!(matches!(
@@ -386,7 +423,7 @@ mod tests {
         let line = format!(
             "beskar7.api=https://h beskar7.namespace=n beskar7.host=h \
             beskar7.token=t beskar7.target=https://t beskar7.target-digest={DIGEST} \
-            beskar7.ca=Zm9v beskar7.timeout=soon"
+            beskar7.provider-id=b7://n/h beskar7.ca=Zm9v beskar7.timeout=soon"
         );
         assert!(matches!(
             BootParams::parse(&line),
@@ -399,7 +436,8 @@ mod tests {
         let line = format!(
             "beskar7.api=https://first beskar7.api=https://second \
             beskar7.namespace=n beskar7.host=h beskar7.token=t \
-            beskar7.target=https://t beskar7.target-digest={DIGEST} beskar7.ca=Zm9v"
+            beskar7.target=https://t beskar7.target-digest={DIGEST} \
+            beskar7.provider-id=b7://n/h beskar7.ca=Zm9v"
         );
         let p = BootParams::parse(&line).expect("valid");
         assert_eq!(p.api, "https://second");
@@ -410,7 +448,8 @@ mod tests {
         let line = format!(
             "root=/dev/sda1 ro beskar7.api=https://h beskar7.namespace=n \
             beskar7.host=h beskar7.token=t beskar7.target=https://t \
-            beskar7.target-digest={DIGEST} beskar7.ca=Zm9v quiet splash"
+            beskar7.target-digest={DIGEST} beskar7.provider-id=b7://n/h \
+            beskar7.ca=Zm9v quiet splash"
         );
         assert!(BootParams::parse(&line).is_ok());
     }
@@ -431,7 +470,7 @@ mod tests {
         let line = format!(
             "beskar7.api=https://h beskar7.namespace=n beskar7.host=h \
             beskar7.token=t beskar7.target=https://t beskar7.target-digest={DIGEST} \
-            beskar7.ca=Zm9v beskar7.debug=yes"
+            beskar7.provider-id=b7://n/h beskar7.ca=Zm9v beskar7.debug=yes"
         );
         let p = BootParams::parse(&line).expect("valid");
         assert!(!p.debug);

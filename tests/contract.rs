@@ -7,9 +7,23 @@
 //! breaks one of the two suites, forcing a coordinated contract bump.
 //! See `docs/inspector-contract.md` §10.
 
+use beskar7_inspector::cmdline::BootParams;
 use beskar7_inspector::report::InspectionReport;
+use beskar7_inspector::CONTRACT_VERSION;
 
 const GOLDEN: &str = include_str!("../test/contract/golden_inspection_report.json");
+
+/// The vendored contract version marker — a byte-copy of beskar7's `VERSION` at the
+/// pinned `contract/<version>` tag (see `test/contract/CONTRACT_REF`). The inspector
+/// half of the cross-repo pin: `CONTRACT_VERSION` must equal its trimmed value, and
+/// the CI `contract-sync` job separately diffs this copy against beskar7's canonical
+/// bytes (GA-CONTRACT-SYNC Option D, §3.3).
+const VENDORED_VERSION: &str = include_str!("../test/contract/VERSION");
+
+/// The v4.2 deploy-path fixture: the byte-exact iPXE `/boot` script beskar7 renders
+/// for a host. Its kernel cmdline carries every `beskar7.*` param the inspector must
+/// parse, including `beskar7.provider-id` (added in v4.2).
+const GOLDEN_BOOT_CMDLINE: &str = include_str!("../test/contract/golden_boot_cmdline.txt");
 
 // Canonical aggregates the controller derives from the golden fixture. Kept in
 // lockstep with the constants in beskar7's controllers/inspection_contract_test.go.
@@ -97,4 +111,39 @@ fn hardware_aggregates_match_contract() {
         GOLDEN_FIRST_NIC_NUM_IPS,
         "ipAddresses is a real array, not a comma-joined string (§6.1)"
     );
+}
+
+/// The inspector-side half of the cross-repo version pin: the implemented
+/// `CONTRACT_VERSION` must equal the vendored `VERSION` marker. The CI
+/// `contract-sync` job proves that vendored copy is byte-identical to beskar7's
+/// canonical file at the pinned tag; this test proves the Rust const agrees with it
+/// (GA-CONTRACT-SYNC Option D, §3.3).
+#[test]
+fn contract_version_matches_vendored_version_file() {
+    assert_eq!(
+        CONTRACT_VERSION,
+        VENDORED_VERSION.trim(),
+        "CONTRACT_VERSION must equal the vendored test/contract/VERSION — bump both \
+         together and re-pin test/contract/CONTRACT_REF"
+    );
+}
+
+/// The v4.2 `beskar7.provider-id` param in the byte-pinned `/boot` render parses
+/// into `BootParams::provider_id`. Guards that the inspector's cmdline parser
+/// accepts every param beskar7 actually emits (deploy-path contract, §5/§9.1).
+#[test]
+fn golden_boot_cmdline_provider_id_parses() {
+    // Parse the fixture's `kernel` line — the args the kernel sees on /proc/cmdline.
+    // BootParams::parse ignores the leading `kernel <vmlinuz-url>` tokens (no `=`)
+    // and every non-beskar7.* param, per the cmdline contract.
+    let kernel_line = GOLDEN_BOOT_CMDLINE
+        .lines()
+        .find(|l| l.trim_start().starts_with("kernel "))
+        .expect("golden boot script has a kernel line");
+    let params = BootParams::parse(kernel_line).expect("golden kernel cmdline parses");
+    assert_eq!(params.provider_id, "b7://contract-test/host-01");
+    // Sanity: the ns/host the provider-id is built from parse too, so the assert
+    // above is not passing on a partially-parsed line.
+    assert_eq!(params.namespace, "contract-test");
+    assert_eq!(params.host, "host-01");
 }
