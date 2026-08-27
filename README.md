@@ -10,7 +10,46 @@ its hardware natively, reports to the Beskar7 controller, then writes the target
 OS image to disk and reboots into it. There is no shell, no busybox, and no
 external tools — every probe and provisioning syscall is performed in-process.
 
-## How it works (contract v4.1)
+## Install (operators)
+
+**You do not need to build this.** Each release publishes the two boot files your
+boot server serves, plus their checksums:
+
+```bash
+REL=https://github.com/projectbeskar/beskar7-inspector/releases/latest/download
+curl -fsSLO $REL/vmlinuz
+curl -fsSLO $REL/initrd.img
+curl -fsSLO $REL/sha256sums.txt
+sha256sum -c sha256sums.txt --ignore-missing
+```
+
+Serve both files from one directory and point `Beskar7Machine.spec.inspectionImageURL`
+at that directory — the controller appends `/vmlinuz` and `/initrd.img` when it
+renders the per-host iPXE script.
+
+### Matching the inspector to your controller
+
+The controller and inspector share a **versioned wire contract**. A controller
+speaking contract `vN` requires an inspector implementing `vN`. Every release
+states its contract version, ships it as `contract-version.txt`, and tags its
+container image accordingly — so you can pull the right one without guessing:
+
+```bash
+# the contract version your controller speaks: test/contract/VERSION in the beskar7 repo
+docker pull ghcr.io/projectbeskar/beskar7-inspector:contract-v4.2
+```
+
+The image carries both files at `/vmlinuz` and `/initrd.img` (convenient for
+air-gapped mirrors):
+
+```bash
+cid=$(docker create ghcr.io/projectbeskar/beskar7-inspector:contract-v4.2)
+docker cp $cid:/vmlinuz . && docker cp $cid:/initrd.img . && docker rm $cid
+```
+
+Building from source is still supported — see [Build, test, lint](#build-test-lint).
+
+## How it works (contract v4.2)
 
 Beskar7 renders a per-host iPXE script that boots this image with the `beskar7.*`
 parameters on the kernel cmdline. The inspector then runs two phases:
@@ -36,7 +75,7 @@ The wire contract — endpoints, cmdline parameters, the report schema, the
 digest-pinning trust model, and the disk/`COS_OEM` behavior — is specified in
 [`docs/inspector-contract.md`](https://github.com/projectbeskar/beskar7/blob/main/docs/inspector-contract.md)
 in the beskar7 repo (the **source of truth**). This repo implements contract
-**v4.1** (`CONTRACT_VERSION` in `src/lib.rs`).
+**v4.2** (`CONTRACT_VERSION` in `src/lib.rs`).
 
 ## Security posture
 
@@ -69,7 +108,7 @@ minimal initramfs (the binary as `/init` plus the mountpoints it needs), and
 takes the kernel from Alpine's `linux-lts`. An operator serves these two files to
 the boot infrastructure the controller's iPXE script points at.
 
-> **Status:** the inspector is feature-complete against contract v4.1 (incl. the
+> **Status:** the inspector is feature-complete against contract v4.2 (incl. the
 > provisioning-complete and provision-failed callbacks) and validated end-to-end on real bare metal; fully unit-
 > and contract-tested. End-to-end boot on real firmware (PXE → inspect → provision
 > → reboot) is validated as part of Beskar7's integration/e2e work, not in this

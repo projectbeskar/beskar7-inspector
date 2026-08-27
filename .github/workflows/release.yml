@@ -1,0 +1,231 @@
+name: Release
+
+# Publishes the two boot artifacts an operator serves to iPXE (vmlinuz +
+# initrd.img), their checksums, and a container image carrying both.
+#
+# Why this exists: the beskar7 controller and this inspector share a VERSIONED
+# wire contract (docs/inspector-contract.md in beskar7). A controller speaking
+# contract vN needs an inspector implementing vN. Before this pipeline, adopters
+# had to clone this repo and `make image` themselves, with no way to verify what
+# they built or to know which controller it pairs with. Every release therefore:
+#
+#   1. Gates on the cross-repo contract drift check (Option D / D-019) — we never
+#      ship an inspector whose vendored fixtures have drifted from beskar7's.
+#   2. Publishes contract-version.txt and tags the image `contract-<version>`,
+#      so pairing is discoverable without reading release notes.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and verify, but do not publish (no image push, no release)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate. A release is a promise about the contract, so prove the code is clean
+  # AND that the vendored contract fixtures still match beskar7 at the pinned
+  # ref before anything is published.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: verify (tests + contract lockstep)
+    runs-on: ubuntu-latest
+    outputs:
+      contract_version: ${{ steps.contract.outputs.version }}
+      contract_ref: ${{ steps.contract.outputs.ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install Rust toolchain (stable + rustfmt + clippy)
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Includes tests/contract.rs, which asserts the Rust CONTRACT_VERSION
+      # equals the vendored test/contract/VERSION.
+      - name: Test (unit + contract)
+        run: cargo test --all-targets --verbose
+
+      - name: Resolve contract version and pinned beskar7 ref
+        id: contract
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < test/contract/VERSION)"
+          ref="$(tr -d '[:space:]' < test/contract/CONTRACT_REF)"
+          [ -n "$version" ] || { echo "::error::test/contract/VERSION is empty"; exit 1; }
+          [ -n "$ref" ] || { echo "::error::test/contract/CONTRACT_REF is empty"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "contract $version (pinned to beskar7 $ref)"
+
+      # The release-time re-run of the CI drift gate. CI proves it on every PR;
+      # this proves it again at the exact commit being released, because a stale
+      # vendored fixture shipped to adopters is precisely the failure the
+      # contract-sync mechanism exists to prevent.
+      - name: Contract drift vs beskar7 (byte-exact, at the pinned tag)
+        run: |
+          set -euo pipefail
+          ref='${{ steps.contract.outputs.ref }}'
+          git clone --depth 1 --branch "$ref" \
+            https://github.com/projectbeskar/beskar7 beskar7-upstream
+          rc=0
+          for f in VERSION golden_inspection_report.json golden_boot_cmdline.txt golden_provider_id_artifact.json; do
+            if diff -u "beskar7-upstream/test/contract/$f" "test/contract/$f" > "/tmp/diff-$f" 2>&1; then
+              echo "  IDENTICAL  $f"
+            else
+              echo "::error::contract drift in $f vs beskar7@$ref"; cat "/tmp/diff-$f"; rc=1
+            fi
+          done
+          rm -rf beskar7-upstream
+          exit $rc
+
+  # ---------------------------------------------------------------------------
+  # Build, publish artifacts + image, cut the release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: build + publish
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub Release
+      packages: write   # push the image to ghcr
+    env:
+      CONTRACT_VERSION: ${{ needs.verify.outputs.contract_version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="0.0.0-dev+$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $version (contract ${CONTRACT_VERSION})"
+
+      # The initramfs /init is a static x86_64-musl binary; the artifact is
+      # inherently single-arch, so a plain build (no buildx matrix) is correct.
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker build -t beskar7-inspector:build .
+
+      - name: Extract vmlinuz + initrd.img and checksum them
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cid="$(docker create beskar7-inspector:build)"
+          docker cp "$cid:/vmlinuz"    dist/vmlinuz
+          docker cp "$cid:/initrd.img" dist/initrd.img
+          docker rm "$cid" > /dev/null
+          printf '%s\n' "${CONTRACT_VERSION}" > dist/contract-version.txt
+          cd dist
+          sha256sum vmlinuz initrd.img contract-version.txt > sha256sums.txt
+          echo "--- artifacts ---"; ls -lh; echo; cat sha256sums.txt
+
+      - name: Log in to ghcr
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tagged by release version AND by contract version. The contract tag is
+      # the one that makes the lockstep usable: an operator running a controller
+      # that speaks v4.2 pulls `:contract-v4.2` and is correct by construction.
+      - name: Push image (version + contract + latest tags)
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          base="${REGISTRY}/${IMAGE_NAME}"
+          base="$(echo "$base" | tr '[:upper:]' '[:lower:]')"
+          for tag in "${{ steps.ver.outputs.version }}" "contract-${CONTRACT_VERSION}" latest; do
+            docker tag beskar7-inspector:build "${base}:${tag}"
+            docker push "${base}:${tag}"
+            echo "pushed ${base}:${tag}"
+          done
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          base="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          ver="${{ steps.ver.outputs.version }}"
+          {
+            echo "## beskar7-inspector ${ver}"
+            echo
+            echo "Implements controller↔inspector **contract \`${CONTRACT_VERSION}\`**"
+            echo "(verified byte-identical against beskar7 \`${{ needs.verify.outputs.contract_ref }}\`)."
+            echo
+            echo "> Pair this with a beskar7 controller that speaks \`${CONTRACT_VERSION}\`."
+            echo "> The controller's contract version is in \`test/contract/VERSION\` in the beskar7 repo."
+            echo
+            echo "### Boot artifacts"
+            echo
+            echo "\`vmlinuz\` and \`initrd.img\` are the two files your boot server serves."
+            echo "Serve them under one directory and point \`Beskar7Machine.spec.inspectionImageURL\`"
+            echo "at that directory (the controller appends \`/vmlinuz\` and \`/initrd.img\`)."
+            echo
+            echo '```bash'
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${ver}/vmlinuz"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${ver}/initrd.img"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${ver}/sha256sums.txt"
+            echo "sha256sum -c sha256sums.txt --ignore-missing"
+            echo '```'
+            echo
+            echo "### Container image"
+            echo
+            echo "Carries both files at \`/vmlinuz\` and \`/initrd.img\` (useful for air-gapped mirrors):"
+            echo
+            echo '```bash'
+            echo "docker pull ${base}:contract-${CONTRACT_VERSION}   # or :${ver}"
+            echo "cid=\$(docker create ${base}:${ver}) && docker cp \$cid:/vmlinuz . && docker cp \$cid:/initrd.img . && docker rm \$cid"
+            echo '```'
+            echo
+            echo "### Checksums"
+            echo
+            echo '```'
+            cat dist/sha256sums.txt
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        if: ${{ github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          prerelease=""
+          case "$ver" in *-*) prerelease="--prerelease";; esac
+          gh release create "$ver" \
+            --title "$ver (contract ${CONTRACT_VERSION})" \
+            --notes-file release-notes.md \
+            $prerelease \
+            dist/vmlinuz dist/initrd.img dist/sha256sums.txt dist/contract-version.txt
+
+      - name: Upload artifacts (dry-run / inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-artifacts-${{ steps.ver.outputs.version }}
+          path: dist/
