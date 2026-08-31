@@ -105,10 +105,14 @@ jobs:
     permissions:
       contents: write   # create the GitHub Release
       packages: write   # push the image to ghcr
+      id-token: write   # keyless (OIDC) signing via cosign
     env:
       CONTRACT_VERSION: ${{ needs.verify.outputs.contract_version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
 
       - name: Resolve release version
         id: ver
@@ -159,11 +163,45 @@ jobs:
           set -euo pipefail
           base="${REGISTRY}/${IMAGE_NAME}"
           base="$(echo "$base" | tr '[:upper:]' '[:lower:]')"
+          digest=""
           for tag in "${{ steps.ver.outputs.version }}" "contract-${CONTRACT_VERSION}" latest; do
             docker tag beskar7-inspector:build "${base}:${tag}"
-            docker push "${base}:${tag}"
+            # All tags point at the same image, so the digest is identical; take
+            # it from the first push rather than trusting docker inspect ordering.
+            out="$(docker push "${base}:${tag}")"
+            echo "$out"
+            if [ -z "$digest" ]; then
+              digest="$(printf '%s\n' "$out" | sed -n 's/.*\(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
+            fi
             echo "pushed ${base}:${tag}"
           done
+          [ -n "$digest" ] || { echo "::error::could not determine pushed image digest"; exit 1; }
+          echo "IMAGE_DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "digest: $digest"
+
+      # Sign by DIGEST (tags are mutable; digests are not). Keyless OIDC — no key
+      # to manage. Verify with:
+      #   cosign verify ghcr.io/projectbeskar/beskar7-inspector:contract-v4.2 \
+      #     --certificate-identity-regexp '^https://github.com/projectbeskar/beskar7-inspector/\.github/workflows/release\.yml@refs/tags/.*$' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Sign image (keyless)
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          base="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          cosign sign --yes "${base}@${IMAGE_DIGEST}"
+          echo "signed ${base}@${IMAGE_DIGEST}"
+
+      # These artifacts boot your hardware, so their integrity matters as much as
+      # the image's. Signing sha256sums.txt covers all three files transitively.
+      - name: Sign the checksum manifest (keyless)
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle dist/sha256sums.txt.cosign.bundle \
+            dist/sha256sums.txt
+          echo "--- bundle ---"; head -c 200 dist/sha256sums.txt.cosign.bundle; echo
 
       - name: Write release notes
         run: |
@@ -201,6 +239,21 @@ jobs:
             echo "cid=\$(docker create ${base}:${ver}) && docker cp \$cid:/vmlinuz . && docker cp \$cid:/initrd.img . && docker rm \$cid"
             echo '```'
             echo
+            echo "### Verifying"
+            echo
+            echo "The image is signed (keyless/OIDC) and \`sha256sums.txt\` carries a cosign bundle:"
+            echo
+            echo '```bash'
+            echo "IDENTITY='^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/.*\$'"
+            echo "ISSUER=https://token.actions.githubusercontent.com"
+            echo
+            echo "cosign verify ${base}:${ver} \\"
+            echo "  --certificate-identity-regexp \"\$IDENTITY\" --certificate-oidc-issuer \"\$ISSUER\""
+            echo
+            echo "cosign verify-blob --bundle sha256sums.txt.cosign.bundle \\"
+            echo "  --certificate-identity-regexp \"\$IDENTITY\" --certificate-oidc-issuer \"\$ISSUER\" sha256sums.txt"
+            echo '```'
+            echo
             echo "### Checksums"
             echo
             echo '```'
@@ -222,7 +275,8 @@ jobs:
             --title "$ver (contract ${CONTRACT_VERSION})" \
             --notes-file release-notes.md \
             $prerelease \
-            dist/vmlinuz dist/initrd.img dist/sha256sums.txt dist/contract-version.txt
+            dist/vmlinuz dist/initrd.img dist/sha256sums.txt dist/contract-version.txt \
+            dist/sha256sums.txt.cosign.bundle
 
       - name: Upload artifacts (dry-run / inspection)
         uses: actions/upload-artifact@v4
