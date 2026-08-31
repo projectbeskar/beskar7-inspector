@@ -23,6 +23,22 @@ curl -fsSLO $REL/sha256sums.txt
 sha256sum -c sha256sums.txt --ignore-missing
 ```
 
+These artifacts boot your hardware, so verify them before serving. Releases are
+signed with [cosign](https://docs.sigstore.dev/) keyless signing (no long-lived key):
+
+```bash
+IDENTITY='^https://github.com/projectbeskar/beskar7-inspector/\.github/workflows/release\.yml@refs/tags/.*$'
+ISSUER=https://token.actions.githubusercontent.com
+
+curl -fsSLO $REL/sha256sums.txt.cosign.bundle
+cosign verify-blob --bundle sha256sums.txt.cosign.bundle \
+  --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" \
+  sha256sums.txt
+```
+
+A failed verification means the artifacts were not produced by this project's
+release workflow — do not boot them.
+
 Serve both files from one directory and point `Beskar7Machine.spec.inspectionImageURL`
 at that directory — the controller appends `/vmlinuz` and `/initrd.img` when it
 renders the per-host iPXE script.
