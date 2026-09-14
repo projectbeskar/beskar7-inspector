@@ -32,10 +32,10 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
-  # The base images in the Dockerfile. Note these are tag references, not
-  # digests (`rust:alpine`, `alpine:3.20`), so this proposes tag moves only and
-  # cannot catch a rebuilt tag — pinning by digest, as beskar7 does, is a
-  # separate improvement worth making.
+  # The base images in the Dockerfile. They are pinned `tag@sha256:…`, so this
+  # catches a rebuilt tag as well as a tag move, and Dependabot rewrites the tag
+  # and the digest together. Keep them that way: a bare tag here would let a
+  # rebuilt base change the booted artifact with nothing in the diff to show it.
   - package-ecosystem: docker
     directory: "/"
     schedule:
