@@ -140,6 +140,7 @@ jobs:
           cid="$(docker create beskar7-inspector:build)"
           docker cp "$cid:/vmlinuz"    dist/vmlinuz
           docker cp "$cid:/initrd.img" dist/initrd.img
+          docker cp "$cid:/kernel-version.txt" dist/kernel-version.txt
           docker rm "$cid" > /dev/null
           printf '%s\n' "${CONTRACT_VERSION}" > dist/contract-version.txt
           cd dist
@@ -218,6 +219,9 @@ jobs:
             echo "> The controller's contract version is in \`test/contract/VERSION\` in the beskar7 repo."
             echo
             echo "### Boot artifacts"
+            echo
+            echo "Built against Linux **$(cat dist/kernel-version.txt)**. A kernel change alters which"
+            echo "drivers the initramfs carries, so re-test on your hardware when this moves."
             echo
             echo "\`vmlinuz\` and \`initrd.img\` are the two files your boot server serves."
             echo "Serve them under one directory and point \`Beskar7Machine.spec.inspectionImageURL\`"

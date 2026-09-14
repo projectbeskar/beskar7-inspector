@@ -72,12 +72,16 @@ RUN set -eu; \
     echo "=== beskar7.load ($(wc -l < "$DST/beskar7.load") modules, $builtins already in the kernel) ==="; \
     cat "$DST/beskar7.load"
 RUN find . | cpio --quiet -H newc -o | gzip -9 > /initrd.img \
- && cp /boot/vmlinuz-lts /vmlinuz
+ && cp /boot/vmlinuz-lts /vmlinuz \
+ && ls /lib/modules | head -1 > /kernel-version.txt
 
 # ---- Stage 3: carrier image holding the two artifacts ---------------------
 FROM alpine:3.24
 COPY --from=assemble /vmlinuz /vmlinuz
 COPY --from=assemble /initrd.img /initrd.img
+# The kernel these artifacts carry. An operator booting unfamiliar hardware
+# needs to know this, and the base-image tag alone does not say it.
+COPY --from=assemble /kernel-version.txt /kernel-version.txt
 LABEL org.opencontainers.image.title="beskar7-inspector" \
       org.opencontainers.image.description="Rust hardware-inspection initramfs for the Beskar7 CAPI provider" \
       org.opencontainers.image.source="https://github.com/projectbeskar/beskar7-inspector"
