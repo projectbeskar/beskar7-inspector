@@ -18,7 +18,7 @@ RUN cargo build --release --target x86_64-unknown-linux-musl \
 # ---- Stage 2: assemble the initramfs and take the kernel ------------------
 # kmod + zstd are build-time only (they resolve module deps and decompress the
 # .ko files) — they are NOT copied into the initramfs, which stays binary-only.
-FROM alpine:3.20 AS assemble
+FROM alpine:3.24 AS assemble
 RUN apk add --no-cache linux-lts cpio kmod zstd
 WORKDIR /irfs
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/beskar7-inspector ./init
@@ -57,7 +57,7 @@ RUN find . | cpio --quiet -H newc -o | gzip -9 > /initrd.img \
  && cp /boot/vmlinuz-lts /vmlinuz
 
 # ---- Stage 3: carrier image holding the two artifacts ---------------------
-FROM alpine:3.20
+FROM alpine:3.24
 COPY --from=assemble /vmlinuz /vmlinuz
 COPY --from=assemble /initrd.img /initrd.img
 LABEL org.opencontainers.image.title="beskar7-inspector" \
