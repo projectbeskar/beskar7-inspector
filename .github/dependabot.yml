@@ -1,0 +1,70 @@
+# Keep the dependency closure and the pinned action set current.
+#
+# This pairs with the OSV-Scanner jobs in supply-chain.yml: the weekly scan can
+# now go red on an advisory published against code nobody touched, and something
+# has to propose the bump that clears it. A scanner without an updater just
+# produces a red badge nobody can act on quickly.
+version: 2
+
+updates:
+  # The Rust closure that ships in the initramfs /init. Grouped, because this is
+  # a small binary whose dependencies move together more often than not, and a
+  # per-crate pull request would drown a repository this size.
+  #
+  # Majors are excluded: they are a deliberate decision, and cargo-deny's bans
+  # and licenses checks are worth re-reading when one lands. Minors and patches
+  # still flow, and `cargo-deny --locked` plus fmt/clippy/test gate every one of
+  # them, so a bad bump fails in CI rather than reaching the initramfs.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # The base images in the Dockerfile. Note these are tag references, not
+  # digests (`rust:alpine`, `alpine:3.20`), so this proposes tag moves only and
+  # cannot catch a rebuilt tag — pinning by digest, as beskar7 does, is a
+  # separate improvement worth making.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(images)"
+
+  # Workflow actions, including the commit-pinned ones (OSV-Scanner, cosign,
+  # checkout); Dependabot rewrites the pin and its version comment together.
+  #
+  # Majors are excluded here too: release.yml's artifact and login actions carry
+  # the published boot artifacts and image, so a major belongs in a reviewed
+  # pass rather than a routine merge.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
