@@ -7,7 +7,11 @@
 # the two artifacts an operator serves to iPXE: /vmlinuz and /initrd.img.
 
 # ---- Stage 1: build the static musl binary --------------------------------
-FROM rust:alpine AS build
+# Bases are pinned tag@digest so a rebuilt tag cannot change the artifact
+# silently; Dependabot rewrites both halves together. The tag was `rust:alpine`,
+# which floats across Rust releases as well as Alpine ones — naming the version
+# keeps a toolchain bump a reviewable change rather than a digest bump.
+FROM rust:1.98-alpine3.24@sha256:1716b3aa042d735f4566d14dc54e8037de9d69556e2d5dd58131d93a613d173d AS build
 # ring (pulled in by rustls) builds its asm with a C toolchain + make/perl.
 RUN apk add --no-cache musl-dev gcc make perl
 WORKDIR /src
@@ -18,7 +22,11 @@ RUN cargo build --release --target x86_64-unknown-linux-musl \
 # ---- Stage 2: assemble the initramfs and take the kernel ------------------
 # kmod + zstd are build-time only (they resolve module deps and decompress the
 # .ko files) — they are NOT copied into the initramfs, which stays binary-only.
-FROM alpine:3.24 AS assemble
+# The digest pins the base, NOT the kernel: `apk add linux-lts` resolves against
+# the live 3.24 repository at build time, so the kernel can still move without a
+# change here. That is why the version is recorded in the image below and named
+# in the release notes.
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS assemble
 RUN apk add --no-cache linux-lts cpio kmod zstd
 WORKDIR /irfs
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/beskar7-inspector ./init
@@ -76,7 +84,7 @@ RUN find . | cpio --quiet -H newc -o | gzip -9 > /initrd.img \
  && ls /lib/modules | head -1 > /kernel-version.txt
 
 # ---- Stage 3: carrier image holding the two artifacts ---------------------
-FROM alpine:3.24
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 COPY --from=assemble /vmlinuz /vmlinuz
 COPY --from=assemble /initrd.img /initrd.img
 # The kernel these artifacts carry. An operator booting unfamiliar hardware
