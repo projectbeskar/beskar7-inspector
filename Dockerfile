@@ -33,16 +33,33 @@ RUN chmod 0755 init \
 # Curate the kernel modules (D-012): resolve transitive deps + load order at
 # build time, ship the .ko files uncompressed under /lib/modules/<kver>/, and
 # write an ordered load-list (beskar7.load) the inspector finit_module's at
-# startup. Built-in drivers (modprobe reports them as "builtin") are skipped.
+# startup. Built-in drivers are skipped: modprobe reports them as "builtin" and
+# exits 0, because the driver is already in the kernel image.
+#
+# An entry that does not resolve at all FAILS THE BUILD. modprobe exits non-zero
+# only when the kernel ships nothing under that name, which is what happens when
+# a kernel bump renames a driver. Previously that error was swallowed, so the
+# initramfs shipped without the driver and the first sign of trouble was a NIC
+# or disk that never appeared on real hardware.
 RUN set -eu; \
     KVER=$(ls /lib/modules | head -1); \
     DST="/irfs/lib/modules/$KVER"; \
     mkdir -p "$DST"; \
     depmod "$KVER" 2>/dev/null || true; \
     : > "$DST/beskar7.load"; \
+    : > /tmp/unresolved; \
     grep -vE '^[[:space:]]*(#|$)' /tmp/modules.list | while read -r mod; do \
-        modprobe --show-depends --set-version "$KVER" "$mod" 2>/dev/null || true; \
-    done | awk '$1=="insmod"{print $2}' | awk '!seen[$0]++' | while read -r ko; do \
+        modprobe --show-depends --set-version "$KVER" "$mod" 2>/dev/null \
+            || echo "$mod" >> /tmp/unresolved; \
+    done > /tmp/depends; \
+    if [ -s /tmp/unresolved ]; then \
+        echo "ERROR: modules.list entries do not resolve against kernel $KVER:" >&2; \
+        sed 's/^/  - /' /tmp/unresolved >&2; \
+        echo "A kernel bump can rename a driver or fold it into the image." >&2; \
+        echo "Update modules.list. Do not ship an initramfs missing a driver." >&2; \
+        exit 1; \
+    fi; \
+    awk '$1=="insmod"{print $2}' /tmp/depends | awk '!seen[$0]++' | while read -r ko; do \
         base=$(basename "$ko"); unc="${base%.gz}"; unc="${unc%.zst}"; \
         case "$ko" in \
             *.gz)  gunzip -c "$ko" > "$DST/$unc" ;; \
@@ -51,7 +68,8 @@ RUN set -eu; \
         esac; \
         echo "/lib/modules/$KVER/$unc" >> "$DST/beskar7.load"; \
     done; \
-    echo "=== beskar7.load ($(wc -l < "$DST/beskar7.load") modules) ==="; \
+    builtins=$(awk '$1=="builtin"{print $2}' /tmp/depends | sort -u | wc -l); \
+    echo "=== beskar7.load ($(wc -l < "$DST/beskar7.load") modules, $builtins already in the kernel) ==="; \
     cat "$DST/beskar7.load"
 RUN find . | cpio --quiet -H newc -o | gzip -9 > /initrd.img \
  && cp /boot/vmlinuz-lts /vmlinuz
