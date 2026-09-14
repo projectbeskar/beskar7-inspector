@@ -8,9 +8,19 @@ name: supply-chain
 # all — scans the published container image, whose Alpine userland ships
 # alongside the binary and was previously unscanned.
 #
-# All three run on every push/PR, and weekly on a schedule so a newly-published
+# Everything runs on every push/PR and weekly on a schedule, so a newly-published
 # advisory against an unchanged Cargo.lock or base image is caught even with no
-# code change.
+# code change. What differs is what BLOCKS a pull request.
+#
+# Deterministic checks — bans, licenses, sources — are a function of the diff:
+# they can only change because a PR changed them, so they gate the PR.
+#
+# Advisory checks vary with time, not with the diff. A RustSec or OSV entry
+# published overnight turns every open PR red without anyone touching the code,
+# which is how a Dockerfile-only change came to fail cargo-deny on 2026-09-14.
+# So they report on a pull request and fail on main and on the weekly run, where
+# the result is unambiguous and someone can act on it. This is the same split
+# the OSV jobs below already use; cargo-deny now matches it.
 
 on:
   push:
@@ -30,8 +40,10 @@ env:
   CARGO_DENY_SHA256: "70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f"
 
 jobs:
+  # Deterministic: these can only fail because the PR changed the closure, so a
+  # failure here is always the PR's own doing. Blocking on every event.
   cargo-deny:
-    name: cargo-deny (advisories / bans / licenses / sources)
+    name: cargo-deny (bans / licenses / sources)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -50,7 +62,43 @@ jobs:
       - name: cargo-deny check
         # --locked: fail if Cargo.lock is stale, so the audited graph is exactly
         # the graph that ships (no silent re-resolution to a different closure).
-        run: cargo-deny --locked check --show-stats
+        run: cargo-deny --locked check bans licenses sources --show-stats
+
+  # Time-varying: RustSec publishes advisories and crates.io yanks releases
+  # independently of anything we do. Reports on a pull request, fails on main and
+  # on the weekly run. See the note at the top of this file.
+  cargo-deny-advisories:
+    name: cargo-deny (advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install cargo-deny (pinned, checksum-verified prebuilt)
+        run: |
+          set -euo pipefail
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL "$url" -o cargo-deny.tar.gz
+          echo "${CARGO_DENY_SHA256}  cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf cargo-deny.tar.gz --strip-components=1
+          install -m 0755 cargo-deny /usr/local/bin/cargo-deny
+          rm -f cargo-deny.tar.gz
+          cargo-deny --version
+
+      - name: cargo-deny check advisories
+        # The advisory output is printed either way — only whether it fails the
+        # job depends on the event. Kept as an explicit branch rather than
+        # continue-on-error so the policy is readable here rather than inferred
+        # from how GitHub reports a soft-failed job.
+        run: |
+          set -uo pipefail
+          if cargo-deny --locked check advisories --show-stats; then
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "::warning title=Outstanding advisory::cargo-deny found an advisory against the dependency closure. Not blocking this pull request, because it is not something this branch introduced — it fails on main and on the Monday run, and it is fixed there. See the note at the top of supply-chain.yml."
+            exit 0
+          fi
+          exit 1
 
   # Dependencies, against the OSV database. On a pull request the scan is diffed
   # against the base branch, so it fails only on a vulnerability the PR

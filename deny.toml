@@ -44,13 +44,56 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-# Keep the binary lean and the trust surface small. The closure currently has no
-# duplicate versions; `deny` enforces that — in particular it fails CI if a change
-# splits the deliberately-unified rustls/ring (the Cargo.toml goes to lengths to
-# keep a single rustls + single ring). Wildcard version requirements are denied:
-# a boot-image dependency must be pinned to a range.
-multiple-versions = "deny"
+# Keep the binary lean and the trust surface small. Wildcard version requirements
+# are denied: a boot-image dependency must be pinned to a range.
+#
+# `multiple-versions` warns rather than denies, and the crates that actually
+# matter are denied individually below. A blanket deny does not distinguish the
+# two kinds of duplicate:
+#
+#   * A second copy of a crate that SHIPS in the binary is a real problem — two
+#     TLS stacks, two crypto providers, two digest implementations. That is what
+#     the Cargo.toml goes to lengths to prevent, and it is denied per-crate here.
+#
+#   * A second copy of a proc-macro crate is not. It runs at build time and never
+#     reaches the initramfs. `syn` is the standing example: serde_derive and
+#     thiserror-impl have moved to syn 3 while the icu/idna tree behind
+#     ureq → url is still on syn 2. We do not control that timeline, it will
+#     recur for months, and blanket-denying it blocked unrelated pull requests
+#     for no gain in what boots on the host.
+#
+# Duplicates outside the denied list still surface as warnings in the job log, so
+# a surprising split is visible without being a merge gate.
+multiple-versions = "warn"
 wildcards = "deny"
+
+# The boot-time trust surface: the TLS stack that authenticates the controller,
+# and the two crates behind the image-digest check (contract §8.1) and the
+# zeroing of the bearer token and join secret. A second version of any of these
+# means two implementations of something security-critical in one binary.
+[[bans.deny]]
+crate = "rustls"
+deny-multiple-versions = true
+
+[[bans.deny]]
+crate = "ring"
+deny-multiple-versions = true
+
+[[bans.deny]]
+crate = "rustls-webpki"
+deny-multiple-versions = true
+
+[[bans.deny]]
+crate = "rustls-pki-types"
+deny-multiple-versions = true
+
+[[bans.deny]]
+crate = "sha2"
+deny-multiple-versions = true
+
+[[bans.deny]]
+crate = "zeroize"
+deny-multiple-versions = true
 
 [sources]
 # crates.io only. No git or alternate-registry dependency may enter the boot
