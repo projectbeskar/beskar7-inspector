@@ -263,7 +263,6 @@ fn deploy_error_reason(e: &DeployError) -> &'static str {
         DeployError::Image(
             ImageError::Http(_) | ImageError::Transport(_) | ImageError::Read(_),
         ) => "image fetch failed",
-        DeployError::Image(ImageError::TlsSetup) => "image fetch failed",
         DeployError::Image(ImageError::Write(_)) | DeployError::Sync(_) => {
             "whole-disk write failed"
         }
@@ -471,7 +470,7 @@ mod tests {
             PollVerdict::Abort
         );
         assert_eq!(classify_poll(&ClientError::CaDecode), PollVerdict::Abort);
-        assert_eq!(classify_poll(&ClientError::TlsSetup), PollVerdict::Abort);
+        assert_eq!(classify_poll(&ClientError::CaEmpty), PollVerdict::Abort);
     }
 
     #[test]

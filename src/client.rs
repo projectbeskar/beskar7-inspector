@@ -39,7 +39,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::{ClientConfig, RootCertStore};
+use rustls::RootCertStore;
 
 use crate::cmdline::BootParams;
 use crate::report::InspectionReport;
@@ -80,9 +80,6 @@ pub enum ClientError {
     /// A certificate in `beskar7.ca` could not be parsed / added to the trust store.
     #[error("beskar7.ca is not a valid PEM certificate")]
     CaInvalid,
-    /// The rustls client configuration could not be built.
-    #[error("initializing TLS")]
-    TlsSetup,
     /// The callback returned a non-success, non-retryable HTTP status.
     #[error("callback returned HTTP {0}")]
     Http(u16),
@@ -119,14 +116,20 @@ impl CallbackClient {
     /// `params.ca`. Fails if the CA cannot be decoded/parsed or TLS setup fails.
     pub fn new(params: &BootParams) -> Result<Self, ClientError> {
         let tls = tls_config(&params.ca)?;
-        let agent = ureq::AgentBuilder::new()
+        let agent: ureq::Agent = ureq::Agent::config_builder()
             .tls_config(tls)
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout(CALL_TIMEOUT)
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_global(Some(CALL_TIMEOUT))
             // No redirects: the callback never redirects, and following a 3xx
             // could be steered cross-scheme/cross-host by a MITM.
-            .redirects(0)
-            .build();
+            .max_redirects(0)
+            // Hand every response back as Ok so classify_status is the single
+            // place that decides retryable vs fatal. Without this ureq turns
+            // non-2xx into Err(StatusCode) and the same decision would be split
+            // across two match arms.
+            .http_status_as_error(false)
+            .build()
+            .into();
         Ok(Self {
             agent,
             inspection_url: inspection_url(&params.api, &params.namespace, &params.host),
@@ -150,9 +153,9 @@ impl CallbackClient {
             let result = self
                 .agent
                 .post(&self.inspection_url)
-                .set("Authorization", &auth)
-                .set("Content-Type", "application/json")
-                .send_bytes(&body);
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/json")
+                .send(&body[..]);
             match classify_status(result) {
                 Ok(_resp) => Attempt::Done(()),
                 Err(verdict) => verdict.into_attempt(),
@@ -168,7 +171,7 @@ impl CallbackClient {
             let result = self
                 .agent
                 .get(&self.bootstrap_url)
-                .set("Authorization", &auth)
+                .header("Authorization", &auth)
                 .call();
             match classify_status(result) {
                 Ok(resp) => match read_capped(resp, MAX_BOOTSTRAP_BYTES) {
@@ -196,9 +199,9 @@ impl CallbackClient {
             let result = self
                 .agent
                 .post(&self.provisioned_url)
-                .set("Authorization", &auth)
-                .set("Content-Type", "application/json")
-                .send_bytes(PROVISIONED_BODY);
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/json")
+                .send(PROVISIONED_BODY);
             match classify_status(result) {
                 Ok(_resp) => Attempt::Done(()),
                 Err(verdict) => verdict.into_attempt(),
@@ -222,9 +225,9 @@ impl CallbackClient {
             let result = self
                 .agent
                 .post(&self.provision_failed_url)
-                .set("Authorization", &auth)
-                .set("Content-Type", "application/json")
-                .send_bytes(&body);
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/json")
+                .send(&body[..]);
             match classify_status(result) {
                 Ok(_resp) => Attempt::Done(()),
                 Err(verdict) => verdict.into_attempt(),
@@ -276,35 +279,53 @@ impl Verdict {
 /// Map a ureq result to `Ok(response)` for any 2xx, or a [`Verdict`]: a retryable
 /// status or transport error is [`Verdict::Retry`]; any other status (4xx,
 /// unexpected 3xx) is [`Verdict::Fatal`].
-fn classify_status(result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, Verdict> {
+fn classify_status(
+    result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<ureq::http::Response<ureq::Body>, Verdict> {
     match result {
         Ok(resp) => {
-            let code = resp.status();
+            // http_status_as_error(false) means every status arrives here, so this
+            // is the only place that maps a status to retry-or-fail.
+            let code = resp.status().as_u16();
             if (200..300).contains(&code) {
                 Ok(resp)
-            } else {
-                // redirects are disabled, so a 3xx here is unexpected.
-                Err(Verdict::Fatal(ClientError::Http(code)))
-            }
-        }
-        Err(ureq::Error::Status(code, _resp)) => {
-            if is_transient(code) {
+            } else if is_transient(code) {
                 Err(Verdict::Retry(ClientError::Http(code)))
             } else {
+                // redirects are disabled, so a 3xx here is unexpected and fatal.
                 Err(Verdict::Fatal(ClientError::Http(code)))
             }
         }
-        Err(ureq::Error::Transport(t)) => {
-            Err(Verdict::Retry(ClientError::Transport(t.kind().to_string())))
-        }
+        // Everything left is a transport-level failure: connect, TLS, timeout, IO.
+        // All are worth retrying — a TLS failure against a host whose CA we pinned
+        // is far more likely a not-yet-ready listener than a changed identity, and
+        // the bearer token's short lifetime bounds how long we can keep trying.
+        Err(e) => Err(Verdict::Retry(ClientError::Transport(transport_kind(&e)))),
     }
+}
+
+/// A short, stable, log-safe label for a transport error. Deliberately not the
+/// full Display: these strings reach the controller in a /provision-failed
+/// reason, and a URL or header could carry the bearer token (§9).
+pub(crate) fn transport_kind(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::ConnectionFailed => "connection failed",
+        ureq::Error::Timeout(_) => "timeout",
+        ureq::Error::Tls(_) => "tls",
+        ureq::Error::Io(_) => "io",
+        ureq::Error::HostNotFound => "host not found",
+        ureq::Error::TooManyRedirects => "too many redirects",
+        _ => "transport",
+    }
+    .to_string()
 }
 
 /// Read a response body, failing if it would exceed `limit` bytes. Reads one byte
 /// past the limit to distinguish "exactly at the limit" from "over".
-fn read_capped(resp: ureq::Response, limit: u64) -> Result<Vec<u8>, ClientError> {
+fn read_capped(resp: ureq::http::Response<ureq::Body>, limit: u64) -> Result<Vec<u8>, ClientError> {
     let mut buf = Vec::new();
-    resp.into_reader()
+    resp.into_body()
+        .into_reader()
         .take(limit + 1)
         .read_to_end(&mut buf)
         .map_err(|_| ClientError::Body)?;
@@ -374,9 +395,22 @@ fn run_with_retries<T>(
     )))
 }
 
-/// Build a rustls config whose root store trusts *only* the CA in `ca_b64` (a
-/// base64-encoded PEM bundle). No public roots, no insecure-skip path (§8).
-fn tls_config(ca_b64: &str) -> Result<Arc<ClientConfig>, ClientError> {
+/// Build a TLS config whose root store trusts *only* the CA in `ca_b64` (a
+/// base64-encoded PEM bundle). No public roots, no platform trust store, no
+/// insecure-skip path (§8).
+///
+/// ureq 3 builds the rustls ClientConfig itself from `RootCerts::Specific`, which
+/// ends in the same `with_root_certificates(store)` call the hand-built config
+/// used to make — the pinning property is unchanged.
+///
+/// One thing ureq does differently matters, and is why the parse below stays:
+/// its `RootCerts::Specific` path uses `add_parsable_certificates`, which
+/// *silently ignores* anything it cannot parse and only logs the count. Handing
+/// it a half-valid bundle would leave a root store quietly missing certs — it
+/// still fails closed at handshake time, but as an opaque TLS error rather than
+/// a clear CaInvalid at startup. So we parse and validate every cert ourselves
+/// first and keep the precise errors.
+fn tls_config(ca_b64: &str) -> Result<ureq::tls::TlsConfig, ClientError> {
     use base64::Engine;
     use rustls::pki_types::{pem::PemObject, CertificateDer};
 
@@ -391,17 +425,24 @@ fn tls_config(ca_b64: &str) -> Result<Arc<ClientConfig>, ClientError> {
     if certs.is_empty() {
         return Err(ClientError::CaEmpty);
     }
+    // Prove each cert is one rustls will actually accept as a root, so a bundle
+    // ureq would silently drop fails here instead.
     let mut roots = RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert).map_err(|_| ClientError::CaInvalid)?;
+    for cert in &certs {
+        roots
+            .add(cert.clone())
+            .map_err(|_| ClientError::CaInvalid)?;
     }
-    let config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|_| ClientError::TlsSetup)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-    Ok(Arc::new(config))
+
+    let owned: Vec<ureq::tls::Certificate<'static>> = certs
+        .iter()
+        .map(|c| ureq::tls::Certificate::from_der(c.as_ref()).to_owned())
+        .collect();
+
+    Ok(ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::Rustls)
+        .root_certs(ureq::tls::RootCerts::Specific(Arc::new(owned)))
+        .build())
 }
 
 /// `{api}/api/v1/inspection/{ns}/{host}`, tolerating a trailing slash on `api`.
@@ -611,6 +652,29 @@ mod tests {
         }
         assert_eq!(calls.get(), 3); // all attempts used
         assert_eq!(sleeps.get(), 2); // no sleep after the final attempt
+    }
+
+    /// Pins which fetch path may skip TLS verification. The controller callback
+    /// may NOT — it trusts only the CA delivered on the cmdline (§8). The image
+    /// fetch may, because the SHA-256 digest is the anchor there (§8.1). Both
+    /// mistakes would be silent in normal operation, so assert the split rather
+    /// than trusting the two call sites to stay correct.
+    #[test]
+    fn the_callback_verifies_and_only_the_image_fetch_does_not() {
+        let callback = tls_config(&b64(TEST_CA_PEM.as_bytes())).expect("valid CA");
+        assert!(
+            !callback.disable_verification(),
+            "the controller callback must verify"
+        );
+        assert!(
+            matches!(callback.root_certs(), ureq::tls::RootCerts::Specific(_)),
+            "the callback must trust only the delivered CA, not platform or webpki roots"
+        );
+
+        assert!(
+            crate::image::no_verify_tls_config().disable_verification(),
+            "the image fetch is the one path that skips verification"
+        );
     }
 
     #[test]

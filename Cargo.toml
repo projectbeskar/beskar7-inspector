@@ -52,13 +52,14 @@ thiserror = "2.0"
 # static binary and the dependency surface. default-features off drops
 # gzip/brotli/cookies/charset we don't need; `tls` re-enables rustls.
 #
-# Still on the 2.x line, but NOT for the reason this comment used to give. It said
-# "ureq 3.x raises its MSRV to 1.85, above this crate's declared 1.74" — and that
-# justification is void: our real floor is 1.86 (measured, see rust-version above),
-# which is *higher* than what ureq 3.x asks for. Nothing about the MSRV blocks the
-# upgrade. What remains is that 3.x is a new major with API changes in
-# src/client.rs, so it wants its own PR and its own release, not a dependency bump.
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
+# On 3.x since 2026-09-15. The 2.x pin used to be justified by an MSRV claim that
+# turned out to be false (see rust-version above); once the real floor was measured
+# at 1.86 — higher than ureq 3 asks for — nothing was left blocking the upgrade.
+#
+# `rustls` rather than the default `platform-verifier`: the inspector runs as PID 1
+# in an initramfs with no system trust store, and must trust ONLY the CA delivered
+# on the kernel cmdline (contract §8). See tls_config() in src/client.rs.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 # rustls is a direct dependency so the client can build a ClientConfig whose root
 # store trusts ONLY the CA delivered on the cmdline (contract §8). Pinned to the
 # 0.23 line ureq uses, so cargo unifies to one rustls. default-features off with
@@ -81,7 +82,7 @@ rustls = { version = "0.23", default-features = false, features = [
 # toolchain), keeping the static-musl build self-contained.
 sha2 = "0.10"
 # Decode the base64-encoded `beskar7.ca` PEM string from the cmdline (§5/§8).
-base64 = "0.22"
+base64 = "0.23"
 # Volatile, non-elidable zeroing of the in-RAM secrets — the bearer token and the
 # fetched CAPI bootstrap user-data (the join secret) — after use, so they do not
 # linger in freed heap (contract §9: the ramdisk runs swapless and the inspector
