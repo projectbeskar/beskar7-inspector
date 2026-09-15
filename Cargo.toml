@@ -2,7 +2,7 @@
 name = "beskar7-inspector"
 version = "0.2.1"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.86"
 license = "Apache-2.0"
 description = "Hardware-inspection ramdisk for the Beskar7 Cluster API bare-metal provider"
 repository = "https://github.com/projectbeskar/beskar7-inspector"
@@ -49,9 +49,15 @@ thiserror = "2.0"
 # Synchronous, rustls-backed HTTP client for the callback POST/GET (contract
 # §4.2/§4.3). Chosen over reqwest because the inspector is a sequential PID 1
 # init with no need for an async runtime — ureq avoids tokio/hyper, shrinking the
-# static binary and the dependency surface. Pinned to the 2.x line: ureq 3.x
-# raises its MSRV to 1.85, above this crate's declared 1.74. default-features off
-# drops gzip/brotli/cookies/charset we don't need; `tls` re-enables rustls.
+# static binary and the dependency surface. default-features off drops
+# gzip/brotli/cookies/charset we don't need; `tls` re-enables rustls.
+#
+# Still on the 2.x line, but NOT for the reason this comment used to give. It said
+# "ureq 3.x raises its MSRV to 1.85, above this crate's declared 1.74" — and that
+# justification is void: our real floor is 1.86 (measured, see rust-version above),
+# which is *higher* than what ureq 3.x asks for. Nothing about the MSRV blocks the
+# upgrade. What remains is that 3.x is a new major with API changes in
+# src/client.rs, so it wants its own PR and its own release, not a dependency bump.
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 # rustls is a direct dependency so the client can build a ClientConfig whose root
 # store trusts ONLY the CA delivered on the cmdline (contract §8). Pinned to the
