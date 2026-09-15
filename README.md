@@ -120,13 +120,16 @@ make test-vm                                   # boot the image in QEMU (Phase 1
 
 `make image` produces the two boot files (`build/vmlinuz`, `build/initrd.img`)
 from the multi-stage `Dockerfile`: it builds the static binary, assembles a
-minimal initramfs (the binary as `/init` plus the mountpoints it needs), and
+minimal initramfs (the binary as `/init`, the curated kernel modules, and the
+mountpoints it needs), and
 takes the kernel from Alpine's `linux-lts`. An operator serves these two files to
 the boot infrastructure the controller's iPXE script points at.
 
 > **Status:** the inspector is feature-complete against contract v4.2 (incl. the
-> provisioning-complete and provision-failed callbacks) and validated end-to-end on real bare metal; fully unit-
-> and contract-tested. End-to-end boot on real firmware (PXE → inspect → provision
+> provisioning-complete and provision-failed callbacks) and fully unit- and
+> contract-tested. `make test-vm` smoke-boots the image in QEMU (Phase 1 only —
+> without a live callback the run stops after cmdline parsing).
+> End-to-end boot (PXE → inspect → provision
 > → reboot) is validated as part of Beskar7's integration/e2e work, not in this
 > repo's CI (which runs fmt, clippy, and tests).
 
