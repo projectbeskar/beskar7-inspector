@@ -40,6 +40,47 @@ jobs:
       - name: Test (unit + contract)
         run: cargo test --all-targets --verbose
 
+  # Enforce the MSRV the manifest declares. Without this the number is decorative:
+  # `rust-version` was 1.74 for months while the crate could not build below 1.86,
+  # because CI only ever used `stable` and the image builds with a current Rust.
+  # That mattered beyond tidiness — it was the stated reason for pinning ureq to
+  # the 2.x line, so a wrong number was steering a dependency decision.
+  #
+  # `cargo check --locked` is the gate rather than a full build: it is what proves
+  # the crate and its locked dependency graph compile on that toolchain, which is
+  # the claim rust-version actually makes. --locked also means a dependency whose
+  # own MSRV rises shows up here as a failure rather than silently raising ours.
+  msrv:
+    name: MSRV (builds on the declared rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          v="$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([0-9.]+)".*/\1/')"
+          [ -n "$v" ] || { echo "::error::could not read rust-version from Cargo.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "declared MSRV: $v"
+
+      - name: Install that toolchain
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-${{ steps.msrv.outputs.version }}-
+
+      - name: cargo check on the declared MSRV
+        run: cargo +${{ steps.msrv.outputs.version }} check --locked --all-targets
+
   # The cross-repo drift gate (GA-CONTRACT-SYNC Option D, §3.3). beskar7 is the
   # single source of truth for the shared wire-contract fixtures; this repo vendors
   # byte-copies under test/contract/ and pins the immutable beskar7 tag they were
