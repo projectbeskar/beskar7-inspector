@@ -1,6 +1,7 @@
 name: supply-chain
 
-# Two gates over what ships in the initramfs /init.
+# Gates over the boot-time trust surface: the Rust dependency closure that ships
+# in the initramfs /init, and the Alpine carrier image published to ghcr.io.
 #
 # cargo-deny checks the dependency closure against RustSec (plus bans, licenses
 # and sources). OSV-Scanner checks the same Cargo.lock against the OSV database,
@@ -132,10 +133,13 @@ jobs:
       # Report on a push; fail on the weekly run.
       fail-on-vuln: ${{ github.event_name == 'schedule' }}
 
-  # The published image. `make image` / the release build the same Dockerfile,
-  # and its Alpine userland ships in the initramfs the inspector boots from, so
-  # it needs scanning as much as the Rust closure does. OSV-Scanner takes one
-  # image per archive, hence the docker save.
+  # The published carrier image. `make image` / the release build the same
+  # Dockerfile. Its Alpine userland does NOT ship in the initramfs — that stays
+  # binary-only (see the stage-2 comment in the Dockerfile): the initramfs holds
+  # the static init, the curated .ko files and a few mountpoints, nothing else.
+  # The carrier image still needs scanning on its own merits, because it is what
+  # is published to ghcr.io and what anyone pulling the image actually runs.
+  # OSV-Scanner takes one image per archive, hence the docker save.
   osv-image-scan:
     name: OSV-Scanner (image)
     runs-on: ubuntu-latest

@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 #
 # Build beskar7-inspector as a self-contained initramfs: one static
-# x86_64-musl binary used directly as /init, plus the empty mountpoints it needs
-# and a console device node. No shell, no busybox, no external tools — the binary
+# x86_64-musl binary used directly as /init, the curated kernel modules under
+# /lib/modules/<kver>/, plus the empty mountpoints it needs and a console device
+# node. No shell, no busybox, no external tools — the binary
 # probes hardware and performs every provisioning syscall natively. The output is
 # the two artifacts an operator serves to iPXE: /vmlinuz and /initrd.img.
 
@@ -91,7 +92,7 @@ COPY --from=assemble /initrd.img /initrd.img
 # needs to know this, and the base-image tag alone does not say it.
 COPY --from=assemble /kernel-version.txt /kernel-version.txt
 LABEL org.opencontainers.image.title="beskar7-inspector" \
-      org.opencontainers.image.description="Rust hardware-inspection initramfs for the Beskar7 CAPI provider" \
+      org.opencontainers.image.description="Carrier image for the Beskar7 hardware-inspection initramfs (vmlinuz + initrd.img)" \
       org.opencontainers.image.source="https://github.com/projectbeskar/beskar7-inspector"
 # `make build` does `docker create` + `docker cp` to extract /vmlinuz + /initrd.img.
 CMD ["/bin/sh"]
