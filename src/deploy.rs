@@ -253,7 +253,7 @@ pub fn write_image(
         })?;
     verify_node_identity(&file, &path, &target.dev_number)?;
 
-    let fetcher = ImageFetcher::new()?;
+    let fetcher = ImageFetcher::new();
     let written = fetcher.fetch_to(image_url, &digest, cap, &mut file)?;
     file.sync_all().map_err(DeployError::Sync)?;
     Ok(written)

@@ -23,7 +23,7 @@
 //! (see `src/client.rs`); it has **no** public webpki roots. It therefore cannot
 //! and MUST NOT attempt to verify a TLS certificate for an arbitrary operator
 //! image host. For an `https://` image, TLS is used for transport encryption
-//! only: the [`NoCertVerify`] verifier performs the handshake-signature check but
+//! only: TLS verification is disabled for this fetch (ureq's disable_verification) but
 //! skips trust-anchor and hostname validation. This is contract-sanctioned for
 //! the image fetch **only** — the integrity gate is the SHA-256 digest, checked
 //! after the whole stream is written — and is NEVER used on the callback path,
@@ -45,13 +45,8 @@
 
 use std::fmt;
 use std::io::{Read, Write};
-use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 
 /// Maximum image size the inspector will stream before aborting (§8.1 size
@@ -68,9 +63,18 @@ const READ_BUF_BYTES: usize = 1024 * 1024;
 /// TCP connect timeout. Generous: a freshly-PXE-booted host may be on a slow or
 /// congested provisioning network.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Per-read inactivity timeout. Bounds a stalled server without capping the total
-/// download time of a legitimately large image (no overall call timeout is set).
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total budget for receiving the image body, starting once response headers
+/// arrive. ureq 3 has no per-read inactivity timeout — `timeout_recv_body` is a
+/// whole-body budget and is explicitly "not restarted for each read" — so the
+/// ureq 2 behaviour (bound a stalled server, never cap a legitimately large
+/// download) cannot be expressed directly.
+///
+/// Two hours is chosen to be loose enough that it can only ever catch a stall:
+/// DEFAULT_MAX_IMAGE_BYTES is 16 GiB, which this budget covers at roughly
+/// 19 Mbit/s — far below anything a provisioning LAN serving the boot images
+/// should manage. A real transfer finishing slower than that is already broken.
+/// The controller's --deployment-timeout remains the outer backstop.
+const RECV_BODY_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Errors from fetching/verifying the target image. These carry no secrets — the
 /// image and its digest are public — so a logged `ImageError` is safe in full.
@@ -82,9 +86,6 @@ pub enum ImageError {
     /// `beskar7.target` used a scheme other than `http`/`https`.
     #[error("beskar7.target must be an http:// or https:// URL")]
     UnsupportedScheme,
-    /// The image-fetch TLS client could not be initialized.
-    #[error("initializing the image-fetch TLS client")]
-    TlsSetup,
     /// The image server returned a non-success status (including an unfollowed
     /// 3xx, since redirects are disabled).
     #[error("image server returned HTTP {0}")]
@@ -186,25 +187,35 @@ pub fn validate_image_scheme(url: &str) -> Result<(), ImageError> {
     }
 }
 
-/// A reusable image-fetch client. Built once; its TLS config uses [`NoCertVerify`]
+/// A reusable image-fetch client. Built once; its TLS config disables verification
 /// (encryption-only, digest is the integrity anchor) and follows **no** redirects.
 pub struct ImageFetcher {
     agent: ureq::Agent,
 }
 
+impl Default for ImageFetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImageFetcher {
     /// Build the fetcher. Fails only if the rustls config cannot be constructed.
-    pub fn new() -> Result<Self, ImageError> {
-        let agent = ureq::AgentBuilder::new()
-            .tls_config(no_verify_tls_config()?)
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(READ_TIMEOUT)
+    pub fn new() -> Self {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .tls_config(no_verify_tls_config())
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_recv_body(Some(RECV_BODY_TIMEOUT))
             // No redirects: §8.1 forbids following a redirect to a non-http(s)
             // target, and safe redirect-following is deferred. An unfollowed 3xx
             // is surfaced as ImageError::Http below.
-            .redirects(0)
-            .build();
-        Ok(Self { agent })
+            .max_redirects(0)
+            // Non-2xx arrives as Ok so the status check below is the only place
+            // that turns a status into ImageError::Http.
+            .http_status_as_error(false)
+            .build()
+            .into();
+        Self { agent }
     }
 
     /// GET `url` and stream it to `sink`, verifying the fully-written bytes against
@@ -222,7 +233,7 @@ impl ImageFetcher {
         validate_image_scheme(url)?;
         let resp = match self.agent.get(url).call() {
             Ok(resp) => {
-                let code = resp.status();
+                let code = resp.status().as_u16();
                 // Redirects are disabled, so a 3xx arrives here as Ok; treat any
                 // non-2xx as an error rather than streaming a redirect body.
                 if !(200..300).contains(&code) {
@@ -230,12 +241,9 @@ impl ImageFetcher {
                 }
                 resp
             }
-            Err(ureq::Error::Status(code, _resp)) => return Err(ImageError::Http(code)),
-            Err(ureq::Error::Transport(t)) => {
-                return Err(ImageError::Transport(t.kind().to_string()))
-            }
+            Err(e) => return Err(ImageError::Transport(crate::client::transport_kind(&e))),
         };
-        stream_verify(resp.into_reader(), expected, max_bytes, sink)
+        stream_verify(resp.into_body().into_reader(), expected, max_bytes, sink)
     }
 }
 
@@ -283,85 +291,25 @@ pub fn stream_verify<R: Read, W: Write>(
     }
     Ok(total)
 }
-
-/// Build a rustls config for the image fetch that performs the handshake-signature
-/// check but skips trust-anchor/hostname validation (§8.1). Confined to this
-/// module; never used on the callback path.
-fn no_verify_tls_config() -> Result<Arc<ClientConfig>, ImageError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(NoCertVerify {
-        provider: provider.clone(),
-    });
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|_| ImageError::TlsSetup)?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
-}
-
-/// A `ServerCertVerifier` that validates the TLS handshake signature (proving the
-/// peer holds the private key for the certificate it presented) but performs **no**
-/// trust-anchor or hostname validation.
+/// TLS for the image fetch, with verification deliberately disabled.
 ///
-/// This exists because the inspector ships no webpki roots and MUST NOT attempt to
-/// verify an arbitrary operator image host (§8.1). For the image fetch, TLS is
-/// transport encryption only; the SHA-256 digest is the integrity/authenticity
-/// anchor. It is intentionally NEVER constructed for the callback client, whose
-/// `RootCertStore` pins the cmdline-delivered CA with full verification.
-#[derive(Debug)]
-struct NoCertVerify {
-    provider: Arc<CryptoProvider>,
-}
-
-impl ServerCertVerifier for NoCertVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        // §8.1: no trust anchors, so no chain/name validation is possible or
-        // permitted here. Integrity is enforced later by the digest gate.
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
+/// The inspector ships no webpki roots and MUST NOT attempt to verify an arbitrary
+/// operator image host (§8.1). For this fetch TLS is transport encryption only —
+/// the SHA-256 digest in `beskar7.target-digest` is the integrity and authenticity
+/// anchor, checked over the fully-written bytes before anything boots them.
+///
+/// ureq 3 provides this directly, which replaced a hand-rolled `ServerCertVerifier`.
+/// That is a real reduction in risk: the old implementation had to re-implement
+/// handshake-signature verification itself to avoid accepting a peer that does not
+/// hold the key, and getting that wrong would have been silent.
+///
+/// This is the ONLY place verification is disabled. The controller callback in
+/// src/client.rs pins the delivered CA and never takes this path.
+pub(crate) fn no_verify_tls_config() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::Rustls)
+        .disable_verification(true)
+        .build()
 }
 
 #[cfg(test)]
@@ -519,17 +467,14 @@ mod tests {
 
     #[test]
     fn fetcher_builds() {
-        assert!(ImageFetcher::new().is_ok());
+        let _ = ImageFetcher::new();
     }
 
     #[test]
-    fn no_verify_advertises_signature_schemes() {
-        let verifier = NoCertVerify {
-            provider: Arc::new(rustls::crypto::ring::default_provider()),
-        };
+    fn no_verify_config_disables_verification() {
         assert!(
-            !verifier.supported_verify_schemes().is_empty(),
-            "the verifier must advertise schemes or rustls rejects the handshake"
+            no_verify_tls_config().disable_verification(),
+            "the image fetch ships no roots and relies on the digest instead (§8.1)"
         );
     }
 }
