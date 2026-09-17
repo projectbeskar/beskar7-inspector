@@ -18,9 +18,17 @@ virtio_scsi
 # Storage (legacy/QEMU + common bare metal)
 ahci
 
-# Networking (QEMU)
+# Networking (QEMU + Intel 1GbE on real hardware)
 virtio_net
 e1000
+# e1000e is a SEPARATE driver from e1000, not a variant of it: e1000 covers the
+# PCI 8254x parts QEMU emulates, e1000e the PCIe 82571+ / I217 / I218 / I219
+# parts most Intel-based servers and workstations actually ship. Without it such
+# a host PXE-boots, loads no NIC driver, and sits in an iPXE retry loop with
+# nothing obviously wrong — found 2026-09-14 on a host that had to be switched to
+# virtio to be testable at all. First entry from the broad bare-metal NIC set the
+# header defers; the rest still is deferred.
+e1000e
 
 # Filesystem — mandatory: COS_OEM (and the deploy mount) is ext2/3/4
 ext4
