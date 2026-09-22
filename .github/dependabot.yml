@@ -35,11 +35,14 @@ updates:
   # The base images in the Dockerfile, pinned `tag@sha256:…`. When a tag moves to
   # a newer release, Dependabot rewrites the tag and the digest together.
   #
-  # It does NOT catch a tag rebuilt in place. Alpine rebuilt `alpine:3.24` on
+  # Do not rely on it for a tag rebuilt in place. It can catch one — it proposed
+  # the rebuilt rust:1.98-alpine3.24 (#51) the day after skipping it for "cooldown
+  # period" — but it missed the one that mattered: Alpine rebuilt `alpine:3.24` on
   # 2026-09-17 (3.24.2, openssl 3.5.7-r0 -> 3.5.8-r0, fixing ten open alerts), and
-  # the next run logged "No update needed for alpine 3.24". So absorbing a
-  # base-image security rebuild is a manual digest bump; the OSV-Scanner (image)
-  # job in supply-chain.yml is what reports that one is due.
+  # its run four days later logged "No update needed for alpine 3.24". The ten
+  # alerts stayed open until a manual bump (#50). The OSV-Scanner (image) job in
+  # supply-chain.yml is the dependable signal: when it reports base-image CVEs,
+  # compare the pinned digest with the registry's instead of waiting for a PR.
   #
   # Keep the pins anyway: a bare tag here would let a rebuilt base change the
   # booted artifact with nothing in the diff to show it.

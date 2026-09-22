@@ -9,9 +9,9 @@
 
 # ---- Stage 1: build the static musl binary --------------------------------
 # Bases are pinned tag@digest so a rebuilt tag cannot change the artifact
-# silently. Dependabot rewrites both halves together when a tag moves, but not
-# when a tag is rebuilt in place — a base-image security rebuild is a manual
-# digest bump (see .github/dependabot.yml). The tag was `rust:alpine`,
+# silently. Dependabot rewrites both halves together when a tag moves; for a tag
+# rebuilt in place it is unreliable, so a base-image security rebuild can need a
+# manual digest bump (see .github/dependabot.yml). The tag was `rust:alpine`,
 # which floats across Rust releases as well as Alpine ones — naming the version
 # keeps a toolchain bump a reviewable change rather than a digest bump.
 FROM rust:1.98-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
