@@ -95,17 +95,19 @@ parameters on the kernel cmdline. The inspector then runs two phases:
 
    Some AMI Aptio versions rebuild `BootOrder` at every POST and drop that
    entry; with their built-in EFI Shell first, every boot ends in the Shell. For
-   that case the inspector also writes a random per-deploy marker
-   `\EFI\beskar7\<random>.id` to the ESP and, when the image has no
-   `startup.nsh` of its own, one at the ESP root: it looks for the marker on
-   `FS0:`–`FS31:` and starts the loader there, or says no disk matched and stops
-   at the Shell prompt. An image's own `startup.nsh` (at the root, in
+   that case, when the image has no `startup.nsh` of its own, the inspector also
+   writes a random per-deploy marker `\EFI\beskar7\<random>.id` and a
+   `startup.nsh` at the ESP root — both or neither. The script looks for the
+   marker on `FS0:`–`FS31:` and starts the loader there, or says no disk matched
+   and stops at the Shell prompt. An image's own `startup.nsh` (at the root, in
    `\EFI\BOOT\` or in `\EFI\tools\`, where the Shell looks) is left in place, and
-   that is logged. The fallback is optional: a full or read-only ESP skips it
-   with a warning; any other write error fails the deploy. Limit: the Shell runs
-   the *first* `startup.nsh` it finds, so one on an earlier mapping (BMC virtual
-   media, another disk) runs instead, and it only sees disks the firmware
-   connected before starting the Shell.
+   that is logged; one of ours from an earlier deploy (an image captured from a
+   provisioned disk) is recognised by its `# Written by beskar7-inspector`
+   comment and replaced. The fallback is optional: a full or read-only ESP skips
+   it with a warning; any other write error fails the deploy. Limit: the Shell
+   runs the *first* `startup.nsh` it finds, so one on an earlier mapping (BMC
+   virtual media, another disk) runs instead, and it only sees disks the
+   firmware connected before starting the Shell.
 
 ```
 power on → PXE → controller-rendered iPXE → inspector

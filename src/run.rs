@@ -313,15 +313,17 @@ fn esp_boot_entry_step(
     }
 }
 
-/// Check the located ESP's loader (`verify`), then register its UEFI boot entry
-/// (`ensure`), both injected so the failure policy is unit-tested:
-///   * a `verify` failure — no loader, or an I/O error mounting/reading the ESP —
-///     points at the image or the disk and is returned (hard failure): a disk
-///     without the loader cannot boot under UEFI anyway;
+/// Prepare the located ESP (`verify`: check its loader, write the marker and the
+/// `startup.nsh` fallback), then register its UEFI boot entry (`ensure`), both
+/// injected so the failure policy is unit-tested:
+///   * a `verify` failure — no loader, or an I/O error mounting, reading or
+///     writing the ESP — points at the image or the disk and is returned (hard
+///     failure): a disk without the loader cannot boot under UEFI anyway. A full
+///     or read-only ESP is not a failure: it only skips the optional fallback;
 ///   * an `ensure` failure — efivarfs mount, NVRAM read or write (boot order locked
-///     in setup, NVRAM full, …) — is logged and the deploy carries on. The firmware's
-///     removable-media fallback can still boot the disk, so the host is never worse
-///     off than without the boot entry.
+///     in setup, NVRAM full, …) — is logged and the deploy carries on. The
+///     `startup.nsh` fallback and the firmware's removable-media fallback can
+///     still boot the disk, so the host is never worse off than without the entry.
 fn register_boot_entry(
     esp: &EspPartition,
     verify: impl FnOnce(&EspPartition) -> Result<(), DeployError>,
@@ -370,12 +372,16 @@ fn esp_prepared_line(prepared: &deploy::EspPrepared, esp: &EspPartition) -> Stri
     let dev = esp.dev_path();
     let marker = &prepared.marker;
     match &prepared.startup_nsh {
-        deploy::StartupNsh::Written => {
+        deploy::StartupNsh::Written { replaced: false } => {
             format!("ESP {dev} prepared: marker {marker}, startup.nsh fallback written")
         }
+        deploy::StartupNsh::Written { replaced: true } => format!(
+            "ESP {dev} prepared: marker {marker}, startup.nsh fallback written, replacing \
+             ours from an earlier deploy"
+        ),
         deploy::StartupNsh::LeftInPlace(path) => format!(
-            "ESP {dev} prepared: marker {marker}; the image's own {path} left in place, \
-             no startup.nsh fallback written"
+            "ESP {dev} prepared: the image's own {path} left in place, no startup.nsh \
+             fallback or marker written"
         ),
         deploy::StartupNsh::NotWritten(cause) => format!(
             "warning: ESP {dev}: startup.nsh fallback not written ({cause}); the deploy \
@@ -452,7 +458,7 @@ fn deploy_error_reason(e: &DeployError) -> &'static str {
         DeployError::EspLoaderMissing { .. } | DeployError::EspLoaderCheck { .. } => {
             "ESP loader check failed"
         }
-        DeployError::EspWrite(_) => "ESP write failed",
+        DeployError::EspWrite { .. } => "ESP write failed",
         DeployError::ConfigWrite(_) | DeployError::ProviderIdWrite(_) => "COS_OEM inject failed",
         // reboot_now's error never flows through run_deploy_steps (it runs after a
         // successful deploy), but keep the match total.
@@ -1123,15 +1129,25 @@ mod tests {
             startup_nsh,
         };
         assert_eq!(
-            esp_prepared_line(&prepared(deploy::StartupNsh::Written), &located_esp()),
+            esp_prepared_line(
+                &prepared(deploy::StartupNsh::Written { replaced: false }),
+                &located_esp()
+            ),
             "ESP /dev/sda1 prepared: marker 0123456789abcdef, startup.nsh fallback written"
+        );
+        assert_eq!(
+            esp_prepared_line(
+                &prepared(deploy::StartupNsh::Written { replaced: true }),
+                &located_esp()
+            ),
+            "ESP /dev/sda1 prepared: marker 0123456789abcdef, startup.nsh fallback written, replacing ours from an earlier deploy"
         );
         assert_eq!(
             esp_prepared_line(
                 &prepared(deploy::StartupNsh::LeftInPlace(r"\startup.nsh".into())),
                 &located_esp()
             ),
-            r"ESP /dev/sda1 prepared: marker 0123456789abcdef; the image's own \startup.nsh left in place, no startup.nsh fallback written"
+            r"ESP /dev/sda1 prepared: the image's own \startup.nsh left in place, no startup.nsh fallback or marker written"
         );
         let skipped = esp_prepared_line(
             &prepared(deploy::StartupNsh::NotWritten(
@@ -1148,7 +1164,10 @@ mod tests {
     #[test]
     fn an_esp_write_failure_has_its_own_reason() {
         assert_eq!(
-            deploy_error_reason(&DeployError::EspWrite(std::io::Error::other("x"))),
+            deploy_error_reason(&DeployError::EspWrite {
+                step: "writing the marker",
+                source: std::io::Error::other("x"),
+            }),
             "ESP write failed"
         );
     }
