@@ -35,7 +35,7 @@ RUN cargo build --release --target x86_64-unknown-linux-musl \
 # against the live 3.24 repository at build time, so either can still move
 # without a change here. That is why the kernel version is recorded in the image
 # below and named in the release notes.
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS assemble
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS assemble
 RUN apk add --no-cache linux-lts cpio kmod zstd \
         linux-firmware-bnx2 linux-firmware-bnx2x linux-firmware-cxgb4 \
         linux-firmware-intel linux-firmware-qed linux-firmware-rtl_nic \
@@ -181,7 +181,7 @@ RUN find . | cpio --quiet -H newc -o | gzip -9 > /initrd.img \
  && ls /lib/modules | head -1 > /kernel-version.txt
 
 # ---- Stage 3: carrier image holding the two artifacts ---------------------
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 COPY --from=assemble /vmlinuz /vmlinuz
 COPY --from=assemble /initrd.img /initrd.img
 # The kernel these artifacts carry. An operator booting unfamiliar hardware
