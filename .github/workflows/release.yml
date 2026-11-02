@@ -85,7 +85,7 @@ jobs:
           git clone --depth 1 --branch "$ref" \
             https://github.com/projectbeskar/beskar7 beskar7-upstream
           rc=0
-          for f in VERSION golden_inspection_report.json golden_boot_cmdline.txt golden_provider_id_artifact.json; do
+          for f in VERSION golden_inspection_report.json golden_boot_cmdline.txt golden_provider_id_artifact.json golden_network_data_artifact.json; do
             if diff -u "beskar7-upstream/test/contract/$f" "test/contract/$f" > "/tmp/diff-$f" 2>&1; then
               echo "  IDENTICAL  $f"
             else

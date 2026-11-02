@@ -1,13 +1,16 @@
 //! Verified-TLS callback client: submit the inspection report and fetch the CAPI
-//! bootstrap user-data (contract §4.2/§4.3/§8/§9).
+//! bootstrap user-data and the per-host network data (contract §4.2/§4.3/§4.6/§8/§9).
 //!
-//! Three requests, all `Authorization: Bearer <token>` over TLS verified against
+//! Five requests, all `Authorization: Bearer <token>` over TLS verified against
 //! the CA delivered on the cmdline (`beskar7.ca`):
 //!   * `POST {api}/api/v1/inspection/{ns}/{host}` — the §6 report. Success is
 //!     **202 Accepted** (the controller writes status asynchronously); the client
 //!     treats any 2xx as success and retries only *transient* failures.
 //!   * `GET {api}/api/v1/bootstrap/{ns}/{host}` — raw CAPI user-data bytes (which
 //!     **may contain cluster join secrets**, contract §4.3/§9).
+//!   * `GET {api}/api/v1/networkdata/{ns}/{host}`: the per-host network data for
+//!     the installed OS (v4.3, §4.6): raw bytes on `200`, "none" on `404`, and a
+//!     fatal refusal on `409` (the host must not install without its network).
 //!   * `POST {api}/api/v1/provisioned/{ns}/{host}` — the provisioning-complete
 //!     callback (D-015), fired after the verified whole-disk write + OEM inject
 //!     and before the reboot, so the controller learns the deploy outcome. Body is
@@ -30,8 +33,8 @@
 //!
 //! ## Secret hygiene (§9)
 //! This module never logs. The bearer token lives only in the `Authorization`
-//! header it builds at the point of use, and the bootstrap bytes are returned to
-//! the caller without ever being formatted. Error values carry only status codes
+//! header it builds at the point of use, and the bootstrap and network data bytes
+//! are returned to the caller without ever being formatted. Error values carry only status codes
 //! and transport-error *kinds* (never URLs, headers, or bodies), so a logged
 //! `ClientError` cannot leak the token or the user-data.
 
@@ -61,6 +64,15 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ignition) is far smaller than this; a larger response is treated as an error
 /// rather than buffered, so a buggy or hostile server cannot exhaust memory.
 const MAX_BOOTSTRAP_BYTES: u64 = 4 * 1024 * 1024;
+/// Cap on the network data body: the controller refuses a Secret over 64 KiB
+/// (§4.6), so a larger response is a protocol violation, not data.
+const MAX_NETWORK_DATA_BYTES: u64 = 64 * 1024;
+/// `/networkdata` status for "no network data for this host" (§4.6). A v4.2
+/// controller without the route answers it too.
+const STATUS_NO_NETWORK_DATA: u16 = 404;
+/// `/networkdata` status for "the host has network data, but its Secret was
+/// refused" (§4.6).
+const STATUS_NETWORK_DATA_REFUSED: u16 = 409;
 /// The fixed, advisory body of the provisioning-complete callback (D-015). The
 /// server treats it as advisory — the path/host carry the identity — so it is a
 /// small constant and carries nothing secret.
@@ -93,6 +105,13 @@ pub enum ClientError {
     /// The bootstrap body exceeded [`MAX_BOOTSTRAP_BYTES`].
     #[error("bootstrap user-data exceeds the size limit")]
     BootstrapTooLarge,
+    /// The network data body exceeded [`MAX_NETWORK_DATA_BYTES`].
+    #[error("network data exceeds the size limit")]
+    NetworkDataTooLarge,
+    /// The controller refused the host's network data with `409` (§4.6): the ref
+    /// is set but its Secret is missing, not opted in, or invalid.
+    #[error("network data refused by the controller")]
+    NetworkDataRefused,
     /// The report could not be serialized to JSON.
     #[error("serializing the inspection report")]
     Serialize,
@@ -106,6 +125,7 @@ pub struct CallbackClient {
     agent: ureq::Agent,
     inspection_url: String,
     bootstrap_url: String,
+    network_data_url: String,
     provisioned_url: String,
     provision_failed_url: String,
     token: Secret,
@@ -134,6 +154,7 @@ impl CallbackClient {
             agent,
             inspection_url: inspection_url(&params.api, &params.namespace, &params.host),
             bootstrap_url: bootstrap_url(&params.api, &params.namespace, &params.host),
+            network_data_url: network_data_url(&params.api, &params.namespace, &params.host),
             provisioned_url: provisioned_url(&params.api, &params.namespace, &params.host),
             provision_failed_url: provision_failed_url(
                 &params.api,
@@ -174,12 +195,51 @@ impl CallbackClient {
                 .header("Authorization", &auth)
                 .call();
             match classify_status(result) {
-                Ok(resp) => match read_capped(resp, MAX_BOOTSTRAP_BYTES) {
-                    Ok(bytes) => Attempt::Done(bytes),
-                    // A mid-stream read failure is transient; an over-limit body
-                    // is a fatal protocol violation.
-                    Err(ClientError::BootstrapTooLarge) => {
-                        Attempt::Fatal(ClientError::BootstrapTooLarge)
+                Ok(resp) => {
+                    match read_capped(resp, MAX_BOOTSTRAP_BYTES, ClientError::BootstrapTooLarge) {
+                        Ok(bytes) => Attempt::Done(bytes),
+                        // A mid-stream read failure is transient; an over-limit body
+                        // is a fatal protocol violation.
+                        Err(ClientError::BootstrapTooLarge) => {
+                            Attempt::Fatal(ClientError::BootstrapTooLarge)
+                        }
+                        Err(e) => Attempt::Retry(e),
+                    }
+                }
+                Err(verdict) => verdict.into_attempt(),
+            }
+        })
+    }
+
+    /// GET the host's network data with the same bearer (§4.6). `Ok(None)` is a
+    /// `404`: the host has no network data (or the controller predates v4.3), so
+    /// no file is written. A `409` is [`ClientError::NetworkDataRefused`] and is
+    /// not retried. Transport failures and `5xx` are retried like the other
+    /// callbacks. The bytes are never logged.
+    pub fn fetch_network_data(&self) -> Result<Option<Vec<u8>>, ClientError> {
+        let auth = self.bearer();
+        run_with_retries(MAX_ATTEMPTS, sleep, |_| {
+            let result = self
+                .agent
+                .get(&self.network_data_url)
+                .header("Authorization", &auth)
+                .call();
+            if let Some(attempt) = result
+                .as_ref()
+                .ok()
+                .and_then(|resp| network_data_status_attempt(resp.status().as_u16()))
+            {
+                return attempt;
+            }
+            match classify_status(result) {
+                Ok(resp) => match read_capped(
+                    resp,
+                    MAX_NETWORK_DATA_BYTES,
+                    ClientError::NetworkDataTooLarge,
+                ) {
+                    Ok(bytes) => Attempt::Done(Some(bytes)),
+                    Err(ClientError::NetworkDataTooLarge) => {
+                        Attempt::Fatal(ClientError::NetworkDataTooLarge)
                     }
                     Err(e) => Attempt::Retry(e),
                 },
@@ -320,9 +380,25 @@ pub(crate) fn transport_kind(e: &ureq::Error) -> String {
     .to_string()
 }
 
-/// Read a response body, failing if it would exceed `limit` bytes. Reads one byte
-/// past the limit to distinguish "exactly at the limit" from "over".
-fn read_capped(resp: ureq::http::Response<ureq::Body>, limit: u64) -> Result<Vec<u8>, ClientError> {
+/// The `/networkdata` statuses with a meaning of their own (§4.6): `404` is "no
+/// network data" and `409` is a refusal that must not be retried. `None` leaves
+/// the status to [`classify_status`].
+fn network_data_status_attempt(status: u16) -> Option<Attempt<Option<Vec<u8>>>> {
+    match status {
+        STATUS_NO_NETWORK_DATA => Some(Attempt::Done(None)),
+        STATUS_NETWORK_DATA_REFUSED => Some(Attempt::Fatal(ClientError::NetworkDataRefused)),
+        _ => None,
+    }
+}
+
+/// Read a response body, failing with `too_large` if it would exceed `limit`
+/// bytes. Reads one byte past the limit to distinguish "exactly at the limit"
+/// from "over".
+fn read_capped(
+    resp: ureq::http::Response<ureq::Body>,
+    limit: u64,
+    too_large: ClientError,
+) -> Result<Vec<u8>, ClientError> {
     let mut buf = Vec::new();
     resp.into_body()
         .into_reader()
@@ -330,7 +406,7 @@ fn read_capped(resp: ureq::http::Response<ureq::Body>, limit: u64) -> Result<Vec
         .read_to_end(&mut buf)
         .map_err(|_| ClientError::Body)?;
     if buf.len() as u64 > limit {
-        return Err(ClientError::BootstrapTooLarge);
+        return Err(too_large);
     }
     Ok(buf)
 }
@@ -465,6 +541,16 @@ fn bootstrap_url(api: &str, namespace: &str, host: &str) -> String {
     )
 }
 
+/// `{api}/api/v1/networkdata/{ns}/{host}`, tolerating a trailing slash on `api`.
+fn network_data_url(api: &str, namespace: &str, host: &str) -> String {
+    format!(
+        "{}/api/v1/networkdata/{}/{}",
+        api.trim_end_matches('/'),
+        namespace,
+        host
+    )
+}
+
 /// `{api}/api/v1/provisioned/{ns}/{host}`, tolerating a trailing slash on `api`.
 fn provisioned_url(api: &str, namespace: &str, host: &str) -> String {
     format!(
@@ -519,6 +605,10 @@ mod tests {
             "https://h:8082/api/v1/bootstrap/ns/node-1"
         );
         assert_eq!(
+            network_data_url("https://h:8082", "ns", "node-1"),
+            "https://h:8082/api/v1/networkdata/ns/node-1"
+        );
+        assert_eq!(
             provisioned_url("https://h:8082", "ns", "node-1"),
             "https://h:8082/api/v1/provisioned/ns/node-1"
         );
@@ -533,6 +623,10 @@ mod tests {
         assert_eq!(
             inspection_url("https://h:8082/", "ns", "h"),
             "https://h:8082/api/v1/inspection/ns/h"
+        );
+        assert_eq!(
+            network_data_url("https://h:8082/", "ns", "h"),
+            "https://h:8082/api/v1/networkdata/ns/h"
         );
         assert_eq!(
             provisioned_url("https://h:8082/", "ns", "h"),
@@ -579,6 +673,45 @@ mod tests {
         for s in [400, 401, 403, 404, 413, 200, 202, 301] {
             assert!(!is_transient(s), "{s} should be terminal");
         }
+    }
+
+    #[test]
+    fn network_data_404_is_no_data_and_409_is_a_fatal_refusal() {
+        assert!(matches!(
+            network_data_status_attempt(404),
+            Some(Attempt::Done(None))
+        ));
+        assert!(matches!(
+            network_data_status_attempt(409),
+            Some(Attempt::Fatal(ClientError::NetworkDataRefused))
+        ));
+        // Everything else goes through the shared classify_status policy.
+        for s in [200, 401, 403, 500, 503] {
+            assert!(network_data_status_attempt(s).is_none(), "{s}");
+        }
+    }
+
+    #[test]
+    fn network_data_endpoint_matches_golden_artifact() {
+        const GOLDEN: &str = include_str!("../test/contract/golden_network_data_artifact.json");
+        let g: serde_json::Value = serde_json::from_str(GOLDEN).expect("golden artifact decodes");
+        let ns = g["namespace"].as_str().expect("golden namespace");
+        let host = g["host"].as_str().expect("golden host");
+        let endpoint = g["endpoint"].as_str().expect("golden endpoint");
+
+        assert_eq!(
+            network_data_url("https://h:8082", ns, host),
+            format!("https://h:8082{endpoint}")
+        );
+        assert_eq!(g["maxSizeBytes"].as_u64(), Some(MAX_NETWORK_DATA_BYTES));
+        assert_eq!(
+            g["statusNoData"].as_u64(),
+            Some(u64::from(STATUS_NO_NETWORK_DATA))
+        );
+        assert_eq!(
+            g["statusRefused"].as_u64(),
+            Some(u64::from(STATUS_NETWORK_DATA_REFUSED))
+        );
     }
 
     #[test]

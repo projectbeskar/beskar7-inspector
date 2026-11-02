@@ -111,7 +111,7 @@ jobs:
       - name: Diff vendored fixtures against beskar7 (byte-exact; any delta fails)
         run: |
           set -euo pipefail
-          for f in VERSION golden_inspection_report.json golden_boot_cmdline.txt golden_provider_id_artifact.json; do
+          for f in VERSION golden_inspection_report.json golden_boot_cmdline.txt golden_provider_id_artifact.json golden_network_data_artifact.json; do
             echo "::group::diff $f"
             diff "beskar7-upstream/test/contract/$f" "test/contract/$f"
             echo "::endgroup::"

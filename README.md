@@ -65,7 +65,7 @@ docker cp $cid:/vmlinuz . && docker cp $cid:/initrd.img . && docker rm $cid
 
 Building from source is still supported — see [Build, test, lint](#build-test-lint).
 
-## How it works (contract v4.2)
+## How it works (contract v4.3)
 
 Beskar7 renders a per-host iPXE script that boots this image with the `beskar7.*`
 parameters on the kernel cmdline. The inspector then runs two phases:
@@ -75,10 +75,12 @@ parameters on the kernel cmdline. The inspector then runs two phases:
    `/proc`), select a target disk, and `POST` the report to the controller over
    verified TLS (success is `202 Accepted`). `--dry-run` stops here.
 2. **Provision** (when bootstrap data is ready) — `GET` the CAPI bootstrap
-   user-data, stream the digest-pinned whole-disk OS image (a Kairos raw image)
+   user-data and the host's network data (if any; a `409` refusal fails the
+   host before the disk is touched), stream the digest-pinned whole-disk OS image (a Kairos raw image)
    onto the selected disk while verifying its SHA-256, register a UEFI boot
    entry for the image's ESP loader, inject a per-host cloud-config (carrying
-   the join secret) into the image's `COS_OEM` partition, and `reboot(2)` into
+   the join secret), the provider-id and the network data into the image's
+   `COS_OEM` partition, and `reboot(2)` into
    the provisioned OS.
 
    The boot entry starts the removable-media loader for the inspector's
@@ -112,7 +114,7 @@ parameters on the kernel cmdline. The inspector then runs two phases:
 ```
 power on → PXE → controller-rendered iPXE → inspector
               Phase 1: probe → POST report (202)
-              Phase 2: GET bootstrap → write image (digest-verified)
+              Phase 2: GET bootstrap + networkdata → write image (digest-verified)
                        → UEFI boot entry for the ESP → inject COS_OEM config
                        → reboot → target OS
 ```
@@ -121,7 +123,7 @@ The wire contract — endpoints, cmdline parameters, the report schema, the
 digest-pinning trust model, and the disk/`COS_OEM` behavior — is specified in
 [`docs/inspector-contract.md`](https://github.com/projectbeskar/beskar7/blob/main/docs/inspector-contract.md)
 in the beskar7 repo (the **source of truth**). This repo implements contract
-**v4.2** (`CONTRACT_VERSION` in `src/lib.rs`).
+**v4.3** (`CONTRACT_VERSION` in `src/lib.rs`).
 
 ## Hardware support
 
@@ -214,7 +216,7 @@ firmware they declare, and the mountpoints it needs), and
 takes the kernel from Alpine's `linux-lts`. An operator serves these two files to
 the boot infrastructure the controller's iPXE script points at.
 
-> **Status:** the inspector is feature-complete against contract v4.2 (incl. the
+> **Status:** the inspector is feature-complete against contract v4.3 (incl. the
 > provisioning-complete and provision-failed callbacks) and fully unit- and
 > contract-tested. `make test-vm` smoke-boots the image in QEMU (Phase 1 only —
 > without a live callback the run stops after cmdline parsing).

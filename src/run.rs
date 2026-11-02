@@ -12,6 +12,7 @@
 //! ── --dry-run stops here ─────────────────────────────────────────────────────
 //! ── Phase 2: provision (when bootstrap is ready) ─────────────────────────────
 //! poll GET /bootstrap (404/5xx = not ready)             client::fetch_bootstrap
+//! GET /networkdata (404 = none, 409 = fail the host)    client::fetch_network_data
 //! write the digest-pinned image to the disk             deploy::write_image
 //! re-read the partition table                           deploy::reread_partition_table
 //! locate the ESP on the target disk (UEFI boot only)    esp::find_esp_partition
@@ -20,6 +21,7 @@
 //!   (an NVRAM failure is logged, not fatal)
 //! locate COS_OEM on the target disk                     oem::find_oem_partition
 //! mount COS_OEM, inject 99_beskar7.yaml + provider-id   deploy::inject_oem_config
+//!   (+ network-data when the host has any)
 //! zero the user-data buffer                             drop(user_data)
 //! POST the provisioned-complete callback (202)          client::provisioned
 //! reboot(2)                                             deploy::reboot_now
@@ -48,7 +50,7 @@ use zeroize::Zeroizing;
 
 use crate::client::{CallbackClient, ClientError};
 use crate::cmdline::{BootParams, CmdlineError};
-use crate::deploy::{self, DeployError, Part};
+use crate::deploy::{self, DeployError, OemArtifacts, Part};
 use crate::efiboot::{self, BootEntry, EfiBootError};
 use crate::esp::{self, EspError, EspPartition};
 use crate::image::DEFAULT_MAX_IMAGE_BYTES;
@@ -98,6 +100,10 @@ pub enum RunError {
     /// controller with a fresh token (§9.2).
     #[error("bootstrap fetch aborted (not retryable): {0}")]
     BootstrapAborted(#[source] ClientError),
+    /// Fetching the host's network data failed (§4.6), including a `409` refusal.
+    /// Reported through provision-failed: the host must not install without it.
+    #[error("network data fetch failed: {0}")]
+    NetworkData(#[source] ClientError),
     /// Locating the EFI System Partition on the target disk failed.
     #[error(transparent)]
     Esp(#[from] EspError),
@@ -187,11 +193,30 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
     let user_data = Zeroizing::new(poll_bootstrap(max_polls, sleep, || {
         client.fetch_bootstrap()
     })?);
-    eprintln!("beskar7-inspector: bootstrap data received, provisioning");
+    eprintln!("beskar7-inspector: bootstrap data received");
+
+    // Fetched before the disk write, so a refusal never costs a wiped disk (§4.6).
+    let network_data = require_network_data(client.fetch_network_data(), |reason| {
+        client.provision_failed(reason)
+    })?;
+    match &network_data {
+        Some(data) => eprintln!(
+            "beskar7-inspector: network data received ({} bytes)",
+            data.len()
+        ),
+        None => eprintln!("beskar7-inspector: no network data for this host"),
+    }
+    eprintln!("beskar7-inspector: provisioning");
+
+    let artifacts = OemArtifacts {
+        user_data: &user_data,
+        provider_id: &params.provider_id,
+        network_data: network_data.as_deref(),
+    };
 
     // The destructive deploy steps. A failure is reported to the controller
     // before the existing abort/halt, like a missing disk above.
-    if let Err(e) = run_deploy_steps(&target, &params, &user_data) {
+    if let Err(e) = run_deploy_steps(&target, &params, &artifacts) {
         return Err(report_provision_failure(e, |reason| {
             client.provision_failed(reason)
         }));
@@ -224,6 +249,15 @@ fn require_target(
     target.map_err(|e| report_provision_failure(e.into(), provision_failed))
 }
 
+/// The host's network data (`None` on a `404`), or the fetch failure after
+/// reporting it through `provision_failed` ([`report_provision_failure`]).
+fn require_network_data(
+    fetched: Result<Option<Vec<u8>>, ClientError>,
+    provision_failed: impl FnOnce(&'static str) -> Result<(), ClientError>,
+) -> Result<Option<Vec<u8>>, RunError> {
+    fetched.map_err(|e| report_provision_failure(RunError::NetworkData(e), provision_failed))
+}
+
 /// Report a Phase 2 failure through the provision-failed callback (D-015 v4.1),
 /// then hand the failure back to propagate. The inspection report was accepted,
 /// so the controller is waiting on this host; the callback lets it fail the
@@ -252,7 +286,7 @@ fn report_provision_failure(
 fn run_deploy_steps(
     target: &crate::target_disk::TargetDisk,
     params: &BootParams,
-    user_data: &[u8],
+    artifacts: &OemArtifacts<'_>,
 ) -> Result<(), RunError> {
     deploy::write_image(
         target,
@@ -284,7 +318,7 @@ fn run_deploy_steps(
         },
     )?;
     let oem_partition = oem::find_oem_partition(target)?;
-    deploy::inject_oem_config(&oem_partition, user_data, &params.provider_id)?;
+    deploy::inject_oem_config(&oem_partition, artifacts)?;
     Ok(())
 }
 
@@ -408,6 +442,8 @@ fn provision_failure_reason(e: &RunError) -> &'static str {
         // find_oem_partition failed — the freshly-written image had no locatable
         // COS_OEM partition to inject into.
         RunError::Oem(_) => "COS_OEM partition not found",
+        RunError::NetworkData(ClientError::NetworkDataRefused) => "network data refused",
+        RunError::NetworkData(_) => "network data fetch failed",
         // Only Disk/Deploy/Esp/Oem errors are reported, but keep the match total so a
         // future step cannot silently fall through without a reason.
         _ => "deploy failed",
@@ -459,7 +495,9 @@ fn deploy_error_reason(e: &DeployError) -> &'static str {
             "ESP loader check failed"
         }
         DeployError::EspWrite { .. } => "ESP write failed",
-        DeployError::ConfigWrite(_) | DeployError::ProviderIdWrite(_) => "COS_OEM inject failed",
+        DeployError::ConfigWrite(_)
+        | DeployError::ProviderIdWrite(_)
+        | DeployError::NetworkDataWrite(_) => "COS_OEM inject failed",
         // reboot_now's error never flows through run_deploy_steps (it runs after a
         // successful deploy), but keep the match total.
         DeployError::Reboot(_) => "deploy failed",
@@ -1061,6 +1099,56 @@ mod tests {
             Err(RunError::Disk(DiskError::NoEligibleDisk))
         ));
         assert_eq!(calls.get(), 1, "reported once, not retried here");
+    }
+
+    // --- network data: fetched before the disk write, a refusal fails the host --
+
+    #[test]
+    fn network_data_is_passed_through_without_a_report() {
+        for fetched in [Some(b"network: {}\n".to_vec()), None] {
+            let out = require_network_data(Ok(fetched.clone()), |reason| {
+                panic!("reported {reason:?} for a good fetch")
+            });
+            assert_eq!(out.expect("the network data"), fetched);
+        }
+    }
+
+    #[test]
+    fn a_refused_network_data_is_reported_then_returned() {
+        let reported = std::cell::RefCell::new(Vec::new());
+        let out = require_network_data(Err(ClientError::NetworkDataRefused), |reason| {
+            reported.borrow_mut().push(reason);
+            Ok(())
+        });
+        assert!(matches!(
+            out,
+            Err(RunError::NetworkData(ClientError::NetworkDataRefused))
+        ));
+        assert_eq!(*reported.borrow(), vec!["network data refused"]);
+    }
+
+    #[test]
+    fn a_failed_network_data_fetch_is_reported_too() {
+        let reported = std::cell::RefCell::new(Vec::new());
+        let out = require_network_data(
+            Err(ClientError::RetriesExhausted(Box::new(ClientError::Http(
+                503,
+            )))),
+            |reason| {
+                reported.borrow_mut().push(reason);
+                Ok(())
+            },
+        );
+        assert!(matches!(out, Err(RunError::NetworkData(_))));
+        assert_eq!(*reported.borrow(), vec!["network data fetch failed"]);
+    }
+
+    #[test]
+    fn a_network_data_write_failure_is_a_cos_oem_inject_failure() {
+        assert_eq!(
+            deploy_error_reason(&DeployError::NetworkDataWrite(std::io::Error::other("x"))),
+            "COS_OEM inject failed"
+        );
     }
 
     #[test]
