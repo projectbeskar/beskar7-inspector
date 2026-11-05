@@ -144,7 +144,7 @@ hardware is absent binds nothing.
 | | Marvell/QLogic FastLinQ, Emulex OneConnect, Marvell/Aquantia AQtion, AMD/Solarflare, Chelsio T4–T6, Cisco UCS VIC | `qede`, `be2net`, `atlantic`, `sfc`, `cxgb4`, `enic` |
 | | Virtual: virtio, VMware vmxnet3 | `virtio_net`, `vmxnet3` |
 | Filesystem | ext4 (for the image's `COS_OEM` partition) | `ext4` |
-| | FAT (for the image's ESP, mounted read-only to check its loader) | `vfat`, `nls_cp437`, `nls_ascii` |
+| | FAT (for the image's ESP: the loader check and the `startup.nsh` fallback) | `vfat`, `nls_cp437`, `nls_ascii` |
 | | efivarfs (for the disk's UEFI boot entry) | `efivarfs` |
 
 Drivers that need device firmware get it from the image. At build time, every

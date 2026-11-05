@@ -161,7 +161,7 @@ const STARTUP_NSH_MAPPINGS: u32 = 32;
 pub enum Part {
     /// The Kairos `COS_OEM` partition (per-host config + provider-id).
     Oem,
-    /// The EFI System Partition (loader check, mounted read-only).
+    /// The EFI System Partition (loader check + `startup.nsh` fallback).
     Esp,
 }
 

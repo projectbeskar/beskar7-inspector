@@ -1,6 +1,7 @@
 //! Locate the EFI System Partition (ESP) on the **selected target disk**, so the
-//! deploy step can check its loader ([`crate::deploy::verify_esp_loader`]) and
-//! register a UEFI boot entry for it ([`crate::efiboot::ensure_disk_boot_entry`]).
+//! deploy step can check its loader, write the `startup.nsh` fallback
+//! ([`crate::deploy::prepare_esp`]), and register a UEFI boot entry for it
+//! ([`crate::efiboot::ensure_disk_boot_entry`]).
 //!
 //! The first reboot after the whole-disk write has no UEFI NVRAM boot entry for
 //! the new disk. The located [`EspPartition`] carries the GPT fields a `HD()`
