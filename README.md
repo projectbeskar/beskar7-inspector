@@ -114,7 +114,7 @@ parameters on the kernel cmdline. The inspector then runs two phases:
 ```
 power on → PXE → controller-rendered iPXE → inspector
               Phase 1: probe → POST report (202)
-              Phase 2: GET bootstrap + networkdata → write image (digest-verified)
+              Phase 2: GET bootstrap + network-data → write image (digest-verified)
                        → UEFI boot entry for the ESP → inject COS_OEM config
                        → reboot → target OS
 ```

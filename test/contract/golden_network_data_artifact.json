@@ -1,7 +1,7 @@
 {
   "namespace": "contract-test",
   "host": "host-01",
-  "endpoint": "/api/v1/networkdata/contract-test/host-01",
+  "endpoint": "/api/v1/network-data/contract-test/host-01",
   "secretKey": "networkData",
   "hostAnnotation": "beskar7.infrastructure.cluster.x-k8s.io/network-data-host",
   "maxSizeBytes": 65536,

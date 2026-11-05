@@ -8,7 +8,7 @@
 //!     treats any 2xx as success and retries only *transient* failures.
 //!   * `GET {api}/api/v1/bootstrap/{ns}/{host}` — raw CAPI user-data bytes (which
 //!     **may contain cluster join secrets**, contract §4.3/§9).
-//!   * `GET {api}/api/v1/networkdata/{ns}/{host}`: the per-host network data for
+//!   * `GET {api}/api/v1/network-data/{ns}/{host}`: the per-host network data for
 //!     the installed OS (v4.3, §4.6): raw bytes on `200`, "none" on `404`, and a
 //!     fatal refusal on `409` (the host must not install without its network).
 //!   * `POST {api}/api/v1/provisioned/{ns}/{host}` — the provisioning-complete
@@ -67,10 +67,10 @@ const MAX_BOOTSTRAP_BYTES: u64 = 4 * 1024 * 1024;
 /// Cap on the network data body: the controller refuses a Secret over 64 KiB
 /// (§4.6), so a larger response is a protocol violation, not data.
 const MAX_NETWORK_DATA_BYTES: u64 = 64 * 1024;
-/// `/networkdata` status for "no network data for this host" (§4.6). A v4.2
+/// `/network-data` status for "no network data for this host" (§4.6). A v4.2
 /// controller without the route answers it too.
 const STATUS_NO_NETWORK_DATA: u16 = 404;
-/// `/networkdata` status for "the host has network data, but its Secret was
+/// `/network-data` status for "the host has network data, but its Secret was
 /// refused" (§4.6).
 const STATUS_NETWORK_DATA_REFUSED: u16 = 409;
 /// The fixed, advisory body of the provisioning-complete callback (D-015). The
@@ -380,7 +380,7 @@ pub(crate) fn transport_kind(e: &ureq::Error) -> String {
     .to_string()
 }
 
-/// The `/networkdata` statuses with a meaning of their own (§4.6): `404` is "no
+/// The `/network-data` statuses with a meaning of their own (§4.6): `404` is "no
 /// network data" and `409` is a refusal that must not be retried. `None` leaves
 /// the status to [`classify_status`].
 fn network_data_status_attempt(status: u16) -> Option<Attempt<Option<Vec<u8>>>> {
@@ -541,10 +541,10 @@ fn bootstrap_url(api: &str, namespace: &str, host: &str) -> String {
     )
 }
 
-/// `{api}/api/v1/networkdata/{ns}/{host}`, tolerating a trailing slash on `api`.
+/// `{api}/api/v1/network-data/{ns}/{host}`, tolerating a trailing slash on `api`.
 fn network_data_url(api: &str, namespace: &str, host: &str) -> String {
     format!(
-        "{}/api/v1/networkdata/{}/{}",
+        "{}/api/v1/network-data/{}/{}",
         api.trim_end_matches('/'),
         namespace,
         host
@@ -606,7 +606,7 @@ mod tests {
         );
         assert_eq!(
             network_data_url("https://h:8082", "ns", "node-1"),
-            "https://h:8082/api/v1/networkdata/ns/node-1"
+            "https://h:8082/api/v1/network-data/ns/node-1"
         );
         assert_eq!(
             provisioned_url("https://h:8082", "ns", "node-1"),
@@ -626,7 +626,7 @@ mod tests {
         );
         assert_eq!(
             network_data_url("https://h:8082/", "ns", "h"),
-            "https://h:8082/api/v1/networkdata/ns/h"
+            "https://h:8082/api/v1/network-data/ns/h"
         );
         assert_eq!(
             provisioned_url("https://h:8082/", "ns", "h"),

@@ -13,7 +13,7 @@ pins the immutable beskar7 git tag they were taken from.
 | `golden_inspection_report.json` | the inspection-report POST body the inspector produces (§6) |
 | `golden_boot_cmdline.txt` | the byte-exact iPXE `/boot` render, incl. `beskar7.provider-id` (v4.2 deploy-path, §5/§9.1) |
 | `golden_provider_id_artifact.json` | descriptor of the `/oem/beskar7/provider-id` `COS_OEM` artifact the inspector writes (v4.2, §9.1 5.4) |
-| `golden_network_data_artifact.json` | the `/networkdata` endpoint (path, cap, `200`/`404`/`409`) and the `/oem/beskar7/network-data` `COS_OEM` artifact the inspector writes (v4.3, §4.6, §9.1 5.4) |
+| `golden_network_data_artifact.json` | the `/network-data` endpoint (path, cap, `200`/`404`/`409`) and the `/oem/beskar7/network-data` `COS_OEM` artifact the inspector writes (v4.3, §4.6, §9.1 5.4) |
 
 ## Dual-repo anti-drift (Option D)
 
@@ -28,7 +28,7 @@ and the consumer (the controller) drifting apart. Two mechanisms enforce it:
 
   | Repo | Test | Asserts |
   |---|---|---|
-  | beskar7-inspector | `tests/contract.rs`, `src/{cmdline,client,deploy}.rs` | the report round-trips losslessly and emits the expected aggregates; `beskar7.provider-id` parses from the golden cmdline; the `provider-id` artifact is written 0600/root, no trailing newline, matching the golden artifact; the `/networkdata` path, cap and statuses match, and the `network-data` artifact is written 0600/root, byte-verbatim; `CONTRACT_VERSION == VERSION.trim()` |
+  | beskar7-inspector | `tests/contract.rs`, `src/{cmdline,client,deploy}.rs` | the report round-trips losslessly and emits the expected aggregates; `beskar7.provider-id` parses from the golden cmdline; the `provider-id` artifact is written 0600/root, no trailing newline, matching the golden artifact; the `/network-data` path, cap and statuses match, and the `network-data` artifact is written 0600/root, byte-verbatim; `CONTRACT_VERSION == VERSION.trim()` |
   | beskar7 | `controllers/*_contract_test.go` | the same bytes decode into the Go types, round-trip, and the renders match `buildBootIPXEScript`/`providerID()` |
 
 Adopting a new contract version means bumping `CONTRACT_REF` + `VERSION` and

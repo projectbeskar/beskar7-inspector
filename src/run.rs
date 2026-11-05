@@ -12,7 +12,7 @@
 //! ── --dry-run stops here ─────────────────────────────────────────────────────
 //! ── Phase 2: provision (when bootstrap is ready) ─────────────────────────────
 //! poll GET /bootstrap (404/5xx = not ready)             client::fetch_bootstrap
-//! GET /networkdata (404 = none, 409 = fail the host)    client::fetch_network_data
+//! GET /network-data (404 = none, 409 = fail the host)    client::fetch_network_data
 //! write the digest-pinned image to the disk             deploy::write_image
 //! re-read the partition table                           deploy::reread_partition_table
 //! locate the ESP on the target disk (UEFI boot only)    esp::find_esp_partition
@@ -32,8 +32,9 @@
 //! `Debug`, zeroed on drop). The fetched bootstrap **user-data is the join
 //! secret**: it is held in a [`Zeroizing`] buffer, passed only to
 //! [`deploy::inject_oem_config`] (which writes it to the `0600` `COS_OEM` file),
-//! and explicitly dropped — zeroing it — before the reboot. Nothing here logs the
-//! token, the user-data, or the full cmdline; [`RunError`] carries only
+//! and explicitly dropped — zeroing it — before the reboot. The network data comes
+//! from a Secret too and gets the same treatment. Nothing here logs the token, the
+//! user-data, the network data, or the full cmdline; [`RunError`] carries only
 //! non-secret module errors. At PID-1 start (non-dry-run) `mlockall` pins all
 //! pages so these secrets never reach swap.
 //!
@@ -198,7 +199,8 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
     // Fetched before the disk write, so a refusal never costs a wiped disk (§4.6).
     let network_data = require_network_data(client.fetch_network_data(), |reason| {
         client.provision_failed(reason)
-    })?;
+    })?
+    .map(Zeroizing::new);
     match &network_data {
         Some(data) => eprintln!(
             "beskar7-inspector: network data received ({} bytes)",
@@ -211,7 +213,7 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
     let artifacts = OemArtifacts {
         user_data: &user_data,
         provider_id: &params.provider_id,
-        network_data: network_data.as_deref(),
+        network_data: network_data.as_ref().map(|data| data.as_slice()),
     };
 
     // The destructive deploy steps. A failure is reported to the controller
@@ -222,10 +224,11 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
         }));
     }
 
-    // Zero the join secret before handing control to the firmware (§9.1 step 6).
+    // Zero the join secret and the network data before handing control to the firmware (§9.1 step 6).
     // The provisioned callback below carries no secret, so it is safe to fire
     // after the secret is gone.
     drop(user_data);
+    drop(network_data);
 
     // Tell the controller the deploy succeeded BEFORE rebooting (D-015): the host
     // is about to reboot into the target OS and never runs the inspector again, so

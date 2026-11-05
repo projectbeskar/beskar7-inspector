@@ -19,7 +19,8 @@
 //!      (`nodev,nosuid,noexec`), write the per-host Kairos cloud-config
 //!      (`99_beskar7.yaml`, carrying the CAPI join secret), the P2 provider-id
 //!      artifact (`beskar7/provider-id`, `b7://<ns>/<host>` verbatim) and, when the
-//!      host has any, the v4.3 network data (`beskar7/network-data`), all
+//!      host has any, the v4.3 network data (`beskar7/network-data`, removed
+//!      when it has none), all
 //!      `0600`/root, `fsync` files + directories, and unmount.
 //!   5. [`reboot_now`] (§9.1 5.4) — `reboot(2)` into the provisioned OS.
 //!
@@ -112,7 +113,7 @@ const OEM_ARTIFACT_SUBDIR: &str = "beskar7";
 /// bootstrap stage can read a *per-host* kubelet `--provider-id` (D-014 P2).
 const OEM_PROVIDER_ID_FILENAME: &str = "provider-id";
 /// The v4.3 network data artifact filename (contract §9.1 5.4). Holds the
-/// `/networkdata` bytes verbatim; no extension, so Kairos does not load it as a
+/// `/network-data` bytes verbatim; no extension, so Kairos does not load it as a
 /// cloud-config.
 const OEM_NETWORK_DATA_FILENAME: &str = "network-data";
 /// Private mountpoint for the `COS_OEM` partition during injection. Created and
@@ -332,7 +333,7 @@ pub enum DeployError {
     /// I/O error for symmetry with [`ConfigWrite`](Self::ConfigWrite).
     #[error("writing the COS_OEM provider-id artifact")]
     ProviderIdWrite(#[source] std::io::Error),
-    /// Writing or flushing the v4.3 `beskar7/network-data` artifact failed (§9.1
+    /// Writing, removing or flushing the v4.3 `beskar7/network-data` artifact failed (§9.1
     /// 5.4). The source is an I/O error only, never the bytes.
     #[error("writing the COS_OEM network-data artifact")]
     NetworkDataWrite(#[source] std::io::Error),
@@ -574,8 +575,8 @@ pub struct OemArtifacts<'a> {
     pub user_data: &'a [u8],
     /// The `beskar7.provider-id` value, written as `beskar7/provider-id`.
     pub provider_id: &'a str,
-    /// The `/networkdata` bytes, written as `beskar7/network-data`; `None` writes
-    /// no file.
+    /// The `/network-data` bytes, written as `beskar7/network-data`; `None` removes
+    /// one the image already carries.
     pub network_data: Option<&'a [u8]>,
 }
 
@@ -613,8 +614,23 @@ fn write_oem_artifacts(mount_dir: &Path, artifacts: &OemArtifacts<'_>) -> Result
     write_and_sync_provider_id(mount_dir, artifacts.provider_id)?;
     match artifacts.network_data {
         Some(data) => write_and_sync_network_data(mount_dir, data),
-        None => Ok(()),
+        None => remove_stale_network_data(mount_dir),
     }
+}
+
+/// Remove a `beskar7/network-data` left on the image (e.g. one captured from a
+/// provisioned disk) and `fsync` the directory, so a host without network data
+/// never boots with another host's addresses.
+fn remove_stale_network_data(mount_dir: &Path) -> Result<(), DeployError> {
+    let dir = mount_dir.join(OEM_ARTIFACT_SUBDIR);
+    match fs::remove_file(dir.join(OEM_NETWORK_DATA_FILENAME)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(DeployError::NetworkDataWrite(e)),
+    }
+    File::open(&dir)
+        .and_then(|d| d.sync_all())
+        .map_err(DeployError::NetworkDataWrite)
 }
 
 /// Remove the partial artifacts after a failed inject, before the unmount (finding
@@ -780,7 +796,7 @@ fn write_and_sync_provider_id(mount_dir: &Path, provider_id: &str) -> Result<(),
     )
 }
 
-/// Write the `/networkdata` bytes verbatim to `<mount_dir>/beskar7/network-data`,
+/// Write the `/network-data` bytes verbatim to `<mount_dir>/beskar7/network-data`,
 /// mode `0600`, and `fsync` it like the provider-id (contract §9.1 5.4). The bytes
 /// are opaque here: how the OS applies them is out of the contract's scope.
 fn write_and_sync_network_data(mount_dir: &Path, network_data: &[u8]) -> Result<(), DeployError> {
@@ -1360,6 +1376,21 @@ mod tests {
         assert!(
             !dir.join(OEM_NETWORK_DATA_FILENAME).exists(),
             "a 404 writes no network-data file"
+        );
+    }
+
+    #[test]
+    fn write_oem_artifacts_removes_a_stale_network_data_when_there_is_none() {
+        let s = crate::probe::testutil::Scratch::new("oem-stale-netdata");
+        let dir = s.path().join(OEM_ARTIFACT_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(OEM_NETWORK_DATA_FILENAME), b"network: {}\n").unwrap();
+
+        write_oem_artifacts(s.path(), &artifacts(None)).expect("artifacts written");
+
+        assert!(
+            !dir.join(OEM_NETWORK_DATA_FILENAME).exists(),
+            "a 404 removes the network-data file the image carried"
         );
     }
 
