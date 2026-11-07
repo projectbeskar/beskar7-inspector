@@ -1131,6 +1131,20 @@ mod tests {
     }
 
     #[test]
+    fn an_unauthorized_network_data_fetch_aborts_the_deploy() {
+        let reported = std::cell::RefCell::new(Vec::new());
+        let out = require_network_data(Err(ClientError::Http(401)), |reason| {
+            reported.borrow_mut().push(reason);
+            Ok(())
+        });
+        assert!(matches!(
+            out,
+            Err(RunError::NetworkData(ClientError::Http(401)))
+        ));
+        assert_eq!(*reported.borrow(), vec!["network data fetch failed"]);
+    }
+
+    #[test]
     fn a_failed_network_data_fetch_is_reported_too() {
         let reported = std::cell::RefCell::new(Vec::new());
         let out = require_network_data(

@@ -712,6 +712,14 @@ mod tests {
             g["statusRefused"].as_u64(),
             Some(u64::from(STATUS_NETWORK_DATA_REFUSED))
         );
+
+        // A 401 has no network data meaning of its own: it is fatal, not retried.
+        let unauthorized = g["statusUnauthorized"]
+            .as_u64()
+            .and_then(|s| u16::try_from(s).ok())
+            .expect("golden statusUnauthorized");
+        assert!(network_data_status_attempt(unauthorized).is_none());
+        assert!(!is_transient(unauthorized));
     }
 
     #[test]

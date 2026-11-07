@@ -11,5 +11,6 @@
   "owner": "root",
   "statusServed": 200,
   "statusNoData": 404,
+  "statusUnauthorized": 401,
   "statusRefused": 409
 }
