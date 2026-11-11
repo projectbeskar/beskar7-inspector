@@ -12,6 +12,19 @@ use std::time::Duration;
 use crate::net::StaticIp;
 use crate::secret::Secret;
 
+/// What the controller booted the inspector for (`beskar7.mode`, contract v4.4 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BootMode {
+    /// No `beskar7.mode`: inspect, then provision.
+    #[default]
+    Provision,
+    /// `beskar7.mode=clean`: wipe every disk of a released host and report (§9.3).
+    Clean,
+}
+
+/// The `beskar7.mode` value of a cleaning boot.
+const MODE_CLEAN: &str = "clean";
+
 /// The boot parameters the controller renders onto the kernel cmdline (§5).
 ///
 /// `Debug` is derived: every field except [`token`](Self::token) is non-secret,
@@ -82,6 +95,8 @@ pub struct BootParams {
     pub timeout: Option<Duration>,
     /// `beskar7.debug` — verbose logging / debug shell on failure.
     pub debug: bool,
+    /// `beskar7.mode`; in [`BootMode::Clean`] the target, digest, provider-id, disk and ip are empty.
+    pub mode: BootMode,
 }
 
 /// Errors from parsing the kernel cmdline. Messages never include parameter
@@ -100,6 +115,9 @@ pub enum CmdlineError {
     /// silently falling back to DHCP.
     #[error("beskar7.ip is not a valid static network spec (<ip>::<gw>:<mask>[:<dns>])")]
     InvalidStaticIp,
+    /// `beskar7.mode` was present with a value other than `clean`.
+    #[error("beskar7.mode is not a known mode")]
+    InvalidMode,
     /// `/proc/cmdline` could not be read.
     #[error("reading /proc/cmdline")]
     Io(#[from] std::io::Error),
@@ -130,6 +148,7 @@ impl BootParams {
         let mut ip = None;
         let mut timeout = None;
         let mut debug = false;
+        let mut mode = BootMode::Provision;
 
         for param in cmdline.split_ascii_whitespace() {
             // Split on the FIRST '=' so that base64 '=' padding in beskar7.ca is
@@ -161,8 +180,23 @@ impl BootParams {
                     }
                 }
                 "beskar7.debug" => debug = value.eq_ignore_ascii_case("true"),
+                "beskar7.mode" => {
+                    mode = match value {
+                        MODE_CLEAN => BootMode::Clean,
+                        _ => return Err(CmdlineError::InvalidMode),
+                    }
+                }
                 _ => {}
             }
+        }
+
+        // A cleaning boot carries none of a claim's parameters, and ignores any it is given (§9.3).
+        if mode == BootMode::Clean {
+            target = Some(String::new());
+            target_digest = Some(String::new());
+            provider_id = Some(String::new());
+            disk = None;
+            ip = None;
         }
 
         let mut missing = Vec::new();
@@ -199,6 +233,7 @@ impl BootParams {
             ip,
             timeout,
             debug,
+            mode,
         })
     }
 }
@@ -259,6 +294,64 @@ mod tests {
         assert_eq!(p.ca, "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==");
         assert_eq!(p.timeout, Some(Duration::from_secs(600)));
         assert!(p.debug);
+    }
+
+    /// The cmdline beskar7 renders for a cleaning boot (contract v4.4 §4.1).
+    const CLEAN: &str = "beskar7.api=https://h:8082 beskar7.namespace=ns beskar7.host=h \
+        beskar7.token=tok beskar7.mode=clean beskar7.ca=Zm9v BOOTIF=01-52-54-00-12-34-56";
+
+    #[test]
+    fn clean_mode_needs_no_target_digest_or_provider_id() {
+        let p = BootParams::parse(CLEAN).expect("valid clean cmdline");
+        assert_eq!(p.mode, BootMode::Clean);
+        assert_eq!(p.host, "h");
+        assert_eq!(p.token.expose(), "tok");
+        assert!(p.target.is_empty());
+        assert!(p.target_digest.is_empty());
+        assert!(p.provider_id.is_empty());
+        assert_eq!(p.bootif.as_deref(), Some("01-52-54-00-12-34-56"));
+    }
+
+    #[test]
+    fn clean_mode_ignores_a_claims_parameters() {
+        let line = format!(
+            "{CLEAN} beskar7.target=https://t beskar7.target-digest={DIGEST} \
+             beskar7.provider-id=b7://ns/h beskar7.disk=sda beskar7.ip=10.0.0.2::10.0.0.1:24"
+        );
+        let p = BootParams::parse(&line).expect("valid");
+        assert!(p.target.is_empty());
+        assert!(p.target_digest.is_empty());
+        assert!(p.provider_id.is_empty());
+        assert_eq!(p.disk, None);
+        assert_eq!(p.ip, None);
+    }
+
+    #[test]
+    fn clean_mode_still_requires_the_callback_parameters() {
+        match BootParams::parse("beskar7.mode=clean beskar7.api=https://h").unwrap_err() {
+            CmdlineError::MissingRequired(names) => {
+                assert!(names.contains("beskar7.token"), "names: {names}");
+                assert!(!names.contains("beskar7.target"), "names: {names}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_mode_is_refused() {
+        let line = format!("{} beskar7.mode=erase", minimal());
+        assert!(matches!(
+            BootParams::parse(&line),
+            Err(CmdlineError::InvalidMode)
+        ));
+    }
+
+    #[test]
+    fn no_mode_is_a_provisioning_run() {
+        assert_eq!(
+            BootParams::parse(&minimal()).expect("valid").mode,
+            BootMode::Provision
+        );
     }
 
     #[test]

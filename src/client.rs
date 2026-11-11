@@ -77,6 +77,8 @@ const STATUS_NETWORK_DATA_REFUSED: u16 = 409;
 /// server treats it as advisory — the path/host carry the identity — so it is a
 /// small constant and carries nothing secret.
 const PROVISIONED_BODY: &[u8] = br#"{"status":"provisioned"}"#;
+/// The fixed, advisory body of the cleaning-complete callback (v4.4 §4.7).
+const CLEANED_BODY: &[u8] = br#"{"status":"cleaned"}"#;
 
 /// Errors from the callback client. Variants deliberately carry no URLs, headers,
 /// or bodies — only status codes and transport-error kinds — so logging a
@@ -128,6 +130,8 @@ pub struct CallbackClient {
     network_data_url: String,
     provisioned_url: String,
     provision_failed_url: String,
+    cleaned_url: String,
+    clean_failed_url: String,
     token: Secret,
 }
 
@@ -158,6 +162,13 @@ impl CallbackClient {
             provisioned_url: provisioned_url(&params.api, &params.namespace, &params.host),
             provision_failed_url: provision_failed_url(
                 &params.api,
+                &params.namespace,
+                &params.host,
+            ),
+            cleaned_url: callback_url(&params.api, CLEANED_ROUTE, &params.namespace, &params.host),
+            clean_failed_url: callback_url(
+                &params.api,
+                CLEAN_FAILED_ROUTE,
                 &params.namespace,
                 &params.host,
             ),
@@ -254,14 +265,30 @@ impl CallbackClient {
     /// [`PROVISIONED_BODY`], the same bearer, 202 (any 2xx) treated as success,
     /// transient transport/5xx failures retried with backoff.
     pub fn provisioned(&self) -> Result<(), ClientError> {
+        self.post_json(&self.provisioned_url, PROVISIONED_BODY)
+    }
+
+    /// POST the cleaning-complete callback once every disk is wiped (v4.4 §4.7).
+    pub fn cleaned(&self) -> Result<(), ClientError> {
+        self.post_json(&self.cleaned_url, CLEANED_BODY)
+    }
+
+    /// POST the cleaning-failed callback with a short, secret-free reason (v4.4 §4.8).
+    pub fn clean_failed(&self, reason: &str) -> Result<(), ClientError> {
+        let body = provision_failed_body(reason)?;
+        self.post_json(&self.clean_failed_url, &body)
+    }
+
+    /// POST `body` with the bearer; any 2xx is success, transient failures are retried.
+    fn post_json(&self, url: &str, body: &[u8]) -> Result<(), ClientError> {
         let auth = self.bearer();
         run_with_retries(MAX_ATTEMPTS, sleep, |_| {
             let result = self
                 .agent
-                .post(&self.provisioned_url)
+                .post(url)
                 .header("Authorization", &auth)
                 .header("Content-Type", "application/json")
-                .send(PROVISIONED_BODY);
+                .send(body);
             match classify_status(result) {
                 Ok(_resp) => Attempt::Done(()),
                 Err(verdict) => verdict.into_attempt(),
@@ -561,6 +588,22 @@ fn provisioned_url(api: &str, namespace: &str, host: &str) -> String {
     )
 }
 
+/// Route of the cleaning-complete callback (v4.4 §4.7).
+const CLEANED_ROUTE: &str = "cleaned";
+/// Route of the cleaning-failed callback (v4.4 §4.8).
+const CLEAN_FAILED_ROUTE: &str = "clean-failed";
+
+/// `{api}/api/v1/{route}/{ns}/{host}`, tolerating a trailing slash on `api`.
+fn callback_url(api: &str, route: &str, namespace: &str, host: &str) -> String {
+    format!(
+        "{}/api/v1/{}/{}/{}",
+        api.trim_end_matches('/'),
+        route,
+        namespace,
+        host
+    )
+}
+
 /// `{api}/api/v1/provision-failed/{ns}/{host}`, tolerating a trailing slash on `api`.
 fn provision_failed_url(api: &str, namespace: &str, host: &str) -> String {
     format!(
@@ -636,6 +679,23 @@ mod tests {
             provision_failed_url("https://h:8082/", "ns", "h"),
             "https://h:8082/api/v1/provision-failed/ns/h"
         );
+    }
+
+    #[test]
+    fn cleaning_urls_are_built_with_the_contract_paths() {
+        assert_eq!(
+            callback_url("https://h:8082/", CLEANED_ROUTE, "ns", "host-1"),
+            "https://h:8082/api/v1/cleaned/ns/host-1"
+        );
+        assert_eq!(
+            callback_url("https://h:8082", CLEAN_FAILED_ROUTE, "ns", "host-1"),
+            "https://h:8082/api/v1/clean-failed/ns/host-1"
+        );
+    }
+
+    #[test]
+    fn cleaned_body_is_the_fixed_advisory_json() {
+        assert_eq!(CLEANED_BODY, br#"{"status":"cleaned"}"#);
     }
 
     #[test]

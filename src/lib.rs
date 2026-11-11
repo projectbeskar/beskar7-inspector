@@ -8,6 +8,7 @@
 //! [`run`], so every module is unit- and contract-testable without booting a
 //! ramdisk.
 
+pub mod clean;
 pub mod client;
 pub mod cmdline;
 pub mod deploy;
@@ -30,4 +31,4 @@ pub mod target_disk;
 /// Changing the wire format, auth, endpoints, or cmdline parameters is a
 /// contract version change that must be coordinated across both repos and the
 /// shared golden fixture (see that document's "Versioning and anti-drift").
-pub const CONTRACT_VERSION: &str = "v4.3";
+pub const CONTRACT_VERSION: &str = "v4.4";
