@@ -17,9 +17,11 @@
 //!      secret on disk.
 //!   4. [`inject_oem_config`] (§9.1 5.3–5.4) — mount the `COS_OEM` partition
 //!      (`nodev,nosuid,noexec`), write the per-host Kairos cloud-config
-//!      (`99_beskar7.yaml`, carrying the CAPI join secret) and the P2 provider-id
-//!      artifact (`beskar7/provider-id`, `b7://<ns>/<host>` verbatim) — both
-//!      `0600`/root — `fsync` files + directories, and unmount.
+//!      (`99_beskar7.yaml`, carrying the CAPI join secret), the P2 provider-id
+//!      artifact (`beskar7/provider-id`, `b7://<ns>/<host>` verbatim) and, when the
+//!      host has any, the v4.3 network data (`beskar7/network-data`, removed
+//!      when it has none), all
+//!      `0600`/root, `fsync` files + directories, and unmount.
 //!   5. [`reboot_now`] (§9.1 5.4) — `reboot(2)` into the provisioned OS.
 //!
 //! The image digest covers only the bytes streamed in step 1; the ESP and
@@ -68,8 +70,8 @@
 //! success or failure (falling back to a lazy `MNT_DETACH` if the eager unmount is
 //! busy) — so the partition is never left mounted across a reboot or a drop to a
 //! debug shell. On an inject failure it first removes the partial `99_beskar7.yaml`
-//! (which may hold the join secret) and the partial `beskar7/provider-id`, and
-//! *then* unmounts (§9.1 step 8). (Unlinking the partial
+//! (which may hold the join secret), the partial `beskar7/provider-id` and
+//! `beskar7/network-data`, and *then* unmounts (§9.1 step 8). (Unlinking the partial
 //! frees but does not wipe its ext blocks on the target disk; that freed-block
 //! remanence is accepted — the secret lives on this disk by design, and the disk
 //! is unbootable until the next attempt overwrites the whole device.)
@@ -102,15 +104,18 @@ use crate::target_disk::TargetDisk;
 /// The per-host Kairos cloud-config filename injected into `COS_OEM`. The `99_`
 /// prefix orders it after the image's baked-in OEM configs so it wins (§9.1 5.3).
 const OEM_CONFIG_FILENAME: &str = "99_beskar7.yaml";
-/// Subdirectory of the `COS_OEM` mount root holding the P2 provider-id artifact
-/// (contract §9.1 5.4). Together with [`OEM_PROVIDER_ID_FILENAME`] this is the
-/// mount-relative path `beskar7/provider-id`, which is `/oem/beskar7/provider-id`
+/// Subdirectory of the `COS_OEM` mount root holding the per-host artifacts
+/// (contract §9.1 5.4). `beskar7/provider-id` here is `/oem/beskar7/provider-id`
 /// once Kairos mounts `COS_OEM` at `/oem` on the provisioned OS.
-const OEM_PROVIDER_ID_SUBDIR: &str = "beskar7";
+const OEM_ARTIFACT_SUBDIR: &str = "beskar7";
 /// The P2 provider-id artifact filename (contract §9.1 5.4). Holds the
 /// `beskar7.provider-id` value (`b7://<ns>/<host>`) verbatim, so a *shared*
 /// bootstrap stage can read a *per-host* kubelet `--provider-id` (D-014 P2).
 const OEM_PROVIDER_ID_FILENAME: &str = "provider-id";
+/// The v4.3 network data artifact filename (contract §9.1 5.4). Holds the
+/// `/network-data` bytes verbatim; no extension, so Kairos does not load it as a
+/// cloud-config.
+const OEM_NETWORK_DATA_FILENAME: &str = "network-data";
 /// Private mountpoint for the `COS_OEM` partition during injection. Created and
 /// removed by [`inject_oem_config`]; on a fresh boot nothing else uses it.
 const OEM_MOUNTPOINT: &str = "/run/beskar7-oem";
@@ -159,7 +164,7 @@ const STARTUP_NSH_MAPPINGS: u32 = 32;
 /// provision-failed reason tell the ESP check and the `COS_OEM` inject apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
-    /// The Kairos `COS_OEM` partition (per-host config + provider-id).
+    /// The Kairos `COS_OEM` partition (per-host config + artifacts).
     Oem,
     /// The EFI System Partition (loader check + `startup.nsh` fallback).
     Esp,
@@ -328,6 +333,10 @@ pub enum DeployError {
     /// I/O error for symmetry with [`ConfigWrite`](Self::ConfigWrite).
     #[error("writing the COS_OEM provider-id artifact")]
     ProviderIdWrite(#[source] std::io::Error),
+    /// Writing, removing or flushing the v4.3 `beskar7/network-data` artifact failed (§9.1
+    /// 5.4). The source is an I/O error only, never the bytes.
+    #[error("writing the COS_OEM network-data artifact")]
+    NetworkDataWrite(#[source] std::io::Error),
     /// The located ESP has no loader at [`ESP_LOADER_PATH`] — the image cannot
     /// boot under UEFI, so a boot entry would point at nothing.
     #[error("the ESP has no loader at {path}")]
@@ -559,10 +568,20 @@ fn new_marker() -> std::io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Mount the located `COS_OEM` partition, write the per-host Kairos cloud-config
-/// (`99_beskar7.yaml`, carrying `user_data` — the CAPI join secret) and the P2
-/// provider-id artifact (`beskar7/provider-id`, `provider_id` verbatim) into it,
-/// and unmount (contract §9.1 5.3–5.5).
+/// What [`inject_oem_config`] writes to `COS_OEM` in one mount session (contract
+/// §9.1 5.3-5.4). No `Debug`: `user_data` is the join secret.
+pub struct OemArtifacts<'a> {
+    /// The CAPI bootstrap user-data, written as `99_beskar7.yaml`.
+    pub user_data: &'a [u8],
+    /// The `beskar7.provider-id` value, written as `beskar7/provider-id`.
+    pub provider_id: &'a str,
+    /// The `/network-data` bytes, written as `beskar7/network-data`; `None` removes
+    /// one the image already carries.
+    pub network_data: Option<&'a [u8]>,
+}
+
+/// Mount the located `COS_OEM` partition, write the [`OemArtifacts`] into it, and
+/// unmount (contract §9.1 5.3–5.5).
 ///
 /// The mount is bound to the partition's **enumerated `major:minor`** (finding
 /// H1 / §9.1 5.3 parentage check): rather than mounting a `/dev/<kname>` path that
@@ -573,31 +592,54 @@ fn new_marker() -> std::io::Result<String> {
 /// artifacts removed first on failure (finding H2 / §9.1 step 8).
 ///
 /// `user_data` is the join secret: it is written only to the `0600`/root file and
-/// is never logged. `provider_id` (`b7://<ns>/<host>`) is non-secret and written
-/// `0600`/root in the same mount session — no extra mount or fetch (§9.1 5.4). The
-/// caller zeroes its `user_data` buffer after this returns.
+/// is never logged. `provider_id` (`b7://<ns>/<host>`) and `network_data` are
+/// written `0600`/root in the same mount session, with no extra mount or fetch
+/// (§9.1 5.4). The caller zeroes its `user_data` buffer after this returns.
 pub fn inject_oem_config(
     oem: &OemPartition,
-    user_data: &[u8],
-    provider_id: &str,
+    artifacts: &OemArtifacts<'_>,
 ) -> Result<(), DeployError> {
     with_private_mount(&OEM_MOUNT, &oem.dev_path(), &oem.dev_number, |mnt| {
-        // Write both artifacts in this one mount session: 99_beskar7.yaml (the join
-        // secret) then beskar7/provider-id (v4.2, §9.1 5.4). On failure, remove both
-        // partials — the config may hold the join secret — BEFORE unmounting (finding
-        // H2 / §9.1 step 8); with_private_mount unmounts only after this returns.
-        // remove_file on a never-created path is a harmless no-op.
-        let inject = write_and_sync_config(mnt, user_data)
-            .and_then(|()| write_and_sync_provider_id(mnt, provider_id));
+        let inject = write_oem_artifacts(mnt, artifacts);
         if inject.is_err() {
-            let _ = fs::remove_file(mnt.join(OEM_CONFIG_FILENAME));
-            let _ = fs::remove_file(
-                mnt.join(OEM_PROVIDER_ID_SUBDIR)
-                    .join(OEM_PROVIDER_ID_FILENAME),
-            );
+            remove_oem_artifacts(mnt);
         }
         inject
     })
+}
+
+/// Write every artifact into the mounted `COS_OEM` root, config first.
+fn write_oem_artifacts(mount_dir: &Path, artifacts: &OemArtifacts<'_>) -> Result<(), DeployError> {
+    write_and_sync_config(mount_dir, artifacts.user_data)?;
+    write_and_sync_provider_id(mount_dir, artifacts.provider_id)?;
+    match artifacts.network_data {
+        Some(data) => write_and_sync_network_data(mount_dir, data),
+        None => remove_stale_network_data(mount_dir),
+    }
+}
+
+/// Remove a `beskar7/network-data` left on the image (e.g. one captured from a
+/// provisioned disk) and `fsync` the directory, so a host without network data
+/// never boots with another host's addresses.
+fn remove_stale_network_data(mount_dir: &Path) -> Result<(), DeployError> {
+    let dir = mount_dir.join(OEM_ARTIFACT_SUBDIR);
+    match fs::remove_file(dir.join(OEM_NETWORK_DATA_FILENAME)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(DeployError::NetworkDataWrite(e)),
+    }
+    File::open(&dir)
+        .and_then(|d| d.sync_all())
+        .map_err(DeployError::NetworkDataWrite)
+}
+
+/// Remove the partial artifacts after a failed inject, before the unmount (finding
+/// H2 / §9.1 step 8). A path that was never created is a no-op.
+fn remove_oem_artifacts(mount_dir: &Path) {
+    let artifact_dir = mount_dir.join(OEM_ARTIFACT_SUBDIR);
+    let _ = fs::remove_file(mount_dir.join(OEM_CONFIG_FILENAME));
+    let _ = fs::remove_file(artifact_dir.join(OEM_PROVIDER_ID_FILENAME));
+    let _ = fs::remove_file(artifact_dir.join(OEM_NETWORK_DATA_FILENAME));
 }
 
 /// Mount the partition `dev` (enumerated as `dev_number`) per `spec`, run `write`
@@ -746,30 +788,55 @@ fn write_and_sync_config(mount_dir: &Path, contents: &[u8]) -> Result<(), Deploy
 /// over an injected directory, so it is unit-tested against a scratch dir without a
 /// real mount.
 fn write_and_sync_provider_id(mount_dir: &Path, provider_id: &str) -> Result<(), DeployError> {
-    let dir = mount_dir.join(OEM_PROVIDER_ID_SUBDIR);
-    fs::create_dir_all(&dir).map_err(DeployError::ProviderIdWrite)?;
-    let path = dir.join(OEM_PROVIDER_ID_FILENAME);
+    write_and_sync_artifact(
+        mount_dir,
+        OEM_PROVIDER_ID_FILENAME,
+        provider_id.as_bytes(),
+        DeployError::ProviderIdWrite,
+    )
+}
+
+/// Write the `/network-data` bytes verbatim to `<mount_dir>/beskar7/network-data`,
+/// mode `0600`, and `fsync` it like the provider-id (contract §9.1 5.4). The bytes
+/// are opaque here: how the OS applies them is out of the contract's scope.
+fn write_and_sync_network_data(mount_dir: &Path, network_data: &[u8]) -> Result<(), DeployError> {
+    write_and_sync_artifact(
+        mount_dir,
+        OEM_NETWORK_DATA_FILENAME,
+        network_data,
+        DeployError::NetworkDataWrite,
+    )
+}
+
+/// Write `contents` verbatim to `<mount_dir>/beskar7/<filename>`, force mode
+/// `0600`, and `fsync` the file, the `beskar7/` directory and the mount root, so
+/// the file and a freshly-created subdirectory both survive the unmount/reboot.
+/// `error` wraps every I/O failure in the artifact's own [`DeployError`] variant.
+fn write_and_sync_artifact(
+    mount_dir: &Path,
+    filename: &str,
+    contents: &[u8],
+    error: fn(std::io::Error) -> DeployError,
+) -> Result<(), DeployError> {
+    let dir = mount_dir.join(OEM_ARTIFACT_SUBDIR);
+    fs::create_dir_all(&dir).map_err(error)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&path)
-        .map_err(DeployError::ProviderIdWrite)?;
+        .open(dir.join(filename))
+        .map_err(error)?;
     // Force exactly 0600 regardless of the inherited umask.
     file.set_permissions(Permissions::from_mode(0o600))
-        .map_err(DeployError::ProviderIdWrite)?;
-    // Verbatim: exactly the cmdline bytes, no trailing newline — a shared bootstrap
-    // stage consumes this as the literal ProviderID (§9.1 5.4).
-    file.write_all(provider_id.as_bytes())
-        .map_err(DeployError::ProviderIdWrite)?;
-    file.sync_all().map_err(DeployError::ProviderIdWrite)?;
-    // fsync the beskar7/ directory, then the mount root, so both the file and the
-    // freshly-created subdirectory's dirent survive the unmount/reboot.
-    let dirf = File::open(&dir).map_err(DeployError::ProviderIdWrite)?;
-    dirf.sync_all().map_err(DeployError::ProviderIdWrite)?;
-    let rootf = File::open(mount_dir).map_err(DeployError::ProviderIdWrite)?;
-    rootf.sync_all().map_err(DeployError::ProviderIdWrite)?;
+        .map_err(error)?;
+    // Verbatim: a downstream consumer reads exactly these bytes (§9.1 5.4).
+    file.write_all(contents).map_err(error)?;
+    file.sync_all().map_err(error)?;
+    File::open(&dir).and_then(|d| d.sync_all()).map_err(error)?;
+    File::open(mount_dir)
+        .and_then(|d| d.sync_all())
+        .map_err(error)?;
     Ok(())
 }
 
@@ -1214,7 +1281,7 @@ mod tests {
             .expect("artifactPath is under /oem/");
         assert_eq!(
             relpath,
-            format!("{OEM_PROVIDER_ID_SUBDIR}/{OEM_PROVIDER_ID_FILENAME}"),
+            format!("{OEM_ARTIFACT_SUBDIR}/{OEM_PROVIDER_ID_FILENAME}"),
             "the write path must match the golden artifactPath"
         );
 
@@ -1223,7 +1290,7 @@ mod tests {
 
         let path = s
             .path()
-            .join(OEM_PROVIDER_ID_SUBDIR)
+            .join(OEM_ARTIFACT_SUBDIR)
             .join(OEM_PROVIDER_ID_FILENAME);
         let meta = std::fs::metadata(&path).expect("file exists");
         assert_eq!(
@@ -1249,9 +1316,112 @@ mod tests {
         write_and_sync_provider_id(s.path(), "b7://n/h").unwrap();
         let path = s
             .path()
-            .join(OEM_PROVIDER_ID_SUBDIR)
+            .join(OEM_ARTIFACT_SUBDIR)
             .join(OEM_PROVIDER_ID_FILENAME);
         assert_eq!(std::fs::read(&path).unwrap(), b"b7://n/h");
+    }
+
+    #[test]
+    fn write_and_sync_network_data_matches_golden_artifact() {
+        // Byte-pin the v4.3 write against the shared golden fixture (§9.1 5.4).
+        const GOLDEN: &str = include_str!("../test/contract/golden_network_data_artifact.json");
+        let g: serde_json::Value = serde_json::from_str(GOLDEN).expect("golden artifact decodes");
+
+        let content = g["content"].as_str().expect("golden content");
+        let artifact_path = g["artifactPath"].as_str().expect("golden artifactPath");
+        assert_eq!(g["mode"].as_str(), Some("0600"), "golden mode is 0600");
+        assert_eq!(g["owner"].as_str(), Some("root"), "golden owner is root");
+
+        let relpath = artifact_path
+            .strip_prefix("/oem/")
+            .expect("artifactPath is under /oem/");
+        assert_eq!(
+            relpath,
+            format!("{OEM_ARTIFACT_SUBDIR}/{OEM_NETWORK_DATA_FILENAME}"),
+            "the write path must match the golden artifactPath"
+        );
+
+        let s = crate::probe::testutil::Scratch::new("oem-netdata");
+        write_and_sync_network_data(s.path(), content.as_bytes()).expect("network data written");
+
+        let path = s
+            .path()
+            .join(OEM_ARTIFACT_SUBDIR)
+            .join(OEM_NETWORK_DATA_FILENAME);
+        let meta = std::fs::metadata(&path).expect("file exists");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "the network-data artifact must be 0600"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+    }
+
+    fn artifacts(network_data: Option<&[u8]>) -> OemArtifacts<'_> {
+        OemArtifacts {
+            user_data: b"#cloud-config\n",
+            provider_id: "b7://ns/host",
+            network_data,
+        }
+    }
+
+    #[test]
+    fn write_oem_artifacts_skips_network_data_when_there_is_none() {
+        let s = crate::probe::testutil::Scratch::new("oem-all-none");
+        write_oem_artifacts(s.path(), &artifacts(None)).expect("artifacts written");
+
+        let dir = s.path().join(OEM_ARTIFACT_SUBDIR);
+        assert!(s.path().join(OEM_CONFIG_FILENAME).exists());
+        assert!(dir.join(OEM_PROVIDER_ID_FILENAME).exists());
+        assert!(
+            !dir.join(OEM_NETWORK_DATA_FILENAME).exists(),
+            "a 404 writes no network-data file"
+        );
+    }
+
+    #[test]
+    fn write_oem_artifacts_removes_a_stale_network_data_when_there_is_none() {
+        let s = crate::probe::testutil::Scratch::new("oem-stale-netdata");
+        let dir = s.path().join(OEM_ARTIFACT_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(OEM_NETWORK_DATA_FILENAME), b"network: {}\n").unwrap();
+
+        write_oem_artifacts(s.path(), &artifacts(None)).expect("artifacts written");
+
+        assert!(
+            !dir.join(OEM_NETWORK_DATA_FILENAME).exists(),
+            "a 404 removes the network-data file the image carried"
+        );
+    }
+
+    #[test]
+    fn write_oem_artifacts_writes_network_data_when_present() {
+        let s = crate::probe::testutil::Scratch::new("oem-all-some");
+        let data: &[u8] = b"network:\n  version: 2\n";
+        write_oem_artifacts(s.path(), &artifacts(Some(data))).expect("artifacts written");
+
+        let path = s
+            .path()
+            .join(OEM_ARTIFACT_SUBDIR)
+            .join(OEM_NETWORK_DATA_FILENAME);
+        assert_eq!(std::fs::read(path).unwrap(), data);
+    }
+
+    #[test]
+    fn remove_oem_artifacts_clears_every_partial() {
+        let s = crate::probe::testutil::Scratch::new("oem-cleanup");
+        let data: &[u8] = b"network: {}\n";
+        write_oem_artifacts(s.path(), &artifacts(Some(data))).unwrap();
+        remove_oem_artifacts(s.path());
+
+        let dir = s.path().join(OEM_ARTIFACT_SUBDIR);
+        for path in [
+            s.path().join(OEM_CONFIG_FILENAME),
+            dir.join(OEM_PROVIDER_ID_FILENAME),
+            dir.join(OEM_NETWORK_DATA_FILENAME),
+        ] {
+            assert!(!path.exists(), "{} must be removed", path.display());
+        }
     }
 
     #[test]
