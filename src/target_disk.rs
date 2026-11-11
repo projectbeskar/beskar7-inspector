@@ -214,6 +214,23 @@ pub fn select(pin: Option<&str>, min_bytes: u64) -> Result<TargetDisk, DiskError
     select_core(block, class_block, resolved.as_deref(), min_bytes, &ramdisk)
 }
 
+/// Every eligible whole disk on the live host, for a cleaning run (contract §9.3).
+/// Uses the selection predicates with no size floor, so a disk backing the running
+/// system, a removable, read-only, virtual or empty one is never wiped.
+pub fn wipe_candidates() -> Vec<TargetDisk> {
+    let block = Path::new(SYSFS_BLOCK);
+    eligible_disks(block, &ramdisk_backing_knames(block))
+}
+
+/// Pure core of [`wipe_candidates`] over an injected `/sys/block`-shaped tree.
+pub(crate) fn eligible_disks(block_dir: &Path, ramdisk: &BTreeSet<String>) -> Vec<TargetDisk> {
+    enumerate(block_dir)
+        .iter()
+        .filter(|c| classify(c, 0, ramdisk).is_ok())
+        .map(Candidate::target)
+        .collect()
+}
+
 /// Pure selection over an injected `/sys/block`-shaped `block_dir` and
 /// `/sys/class/block`-shaped `class_block_dir`. `pin` is an already-resolved
 /// whole-disk kernel name (or `None` for auto-select). Separated from [`select`]
@@ -569,6 +586,25 @@ mod tests {
 
     fn no_ramdisk() -> BTreeSet<String> {
         BTreeSet::new()
+    }
+
+    #[test]
+    fn wipe_candidates_are_every_eligible_disk_and_nothing_else() {
+        let s = Scratch::new("wipe-candidates");
+        let root = s.path();
+        write_disk(root, "sda", 100, false, false);
+        write_disk(root, "sdb", 500, false, false);
+        write_disk(root, "sdc", 32, true, false); // removable
+        write_disk(root, "sdd", 64, false, true); // read-only
+        write_disk(root, "sde", 200, false, false); // backs the system
+        write_virtual(root, "loop0", 1);
+        let ramdisk: BTreeSet<String> = ["sde".to_string()].into();
+
+        let names: Vec<_> = eligible_disks(root, &ramdisk)
+            .into_iter()
+            .map(|d| d.kname)
+            .collect();
+        assert_eq!(names, ["sda", "sdb"]);
     }
 
     #[test]

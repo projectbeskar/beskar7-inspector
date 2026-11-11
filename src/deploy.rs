@@ -1130,6 +1130,16 @@ pub fn reboot_now() -> DeployError {
     }
 }
 
+/// `sync(2)` then power the host off after a cleaning run (v4.4 §4.7). Does not
+/// return on success; the controller forces the host off either way.
+pub fn power_off_now() -> DeployError {
+    nix::unistd::sync();
+    match reboot(RebootMode::RB_POWER_OFF) {
+        Ok(infallible) => match infallible {},
+        Err(source) => DeployError::Reboot(source),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

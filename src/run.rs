@@ -27,6 +27,10 @@
 //! reboot(2)                                             deploy::reboot_now
 //! ```
 //!
+//! With `beskar7.mode=clean` (v4.4 §9.3) the run brings up the network, wipes
+//! every eligible disk ([`crate::clean`]), reports `/cleaned` or `/clean-failed`,
+//! and powers off. It never inspects, fetches bootstrap data or writes an image.
+//!
 //! ## Secret hygiene (§9)
 //! The bearer token lives in a [`Secret`](crate::secret::Secret) (redacted in
 //! `Debug`, zeroed on drop). The fetched bootstrap **user-data is the join
@@ -49,8 +53,9 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
+use crate::clean::{self, CleanError};
 use crate::client::{CallbackClient, ClientError};
-use crate::cmdline::{BootParams, CmdlineError};
+use crate::cmdline::{BootMode, BootParams, CmdlineError};
 use crate::deploy::{self, DeployError, OemArtifacts, Part};
 use crate::efiboot::{self, BootEntry, EfiBootError};
 use crate::esp::{self, EspError, EspPartition};
@@ -114,6 +119,9 @@ pub enum RunError {
     /// A deploy step (write/re-read/mount/inject/reboot) failed.
     #[error(transparent)]
     Deploy(#[from] DeployError),
+    /// The cleaning run could not wipe every disk.
+    #[error(transparent)]
+    Clean(#[from] CleanError),
 }
 
 /// Run the inspector. With `dry_run`, performs **Phase 1 only** (mounts are
@@ -157,6 +165,10 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
         if let Err(e) = net::write_resolv_conf(&net.dns) {
             eprintln!("beskar7-inspector: could not write /etc/resolv.conf: {e}");
         }
+    }
+
+    if params.mode == BootMode::Clean {
+        return run_clean(&params, dry_run);
     }
 
     // ── Phase 1: enroll & inspect (always) ──────────────────────────────────
@@ -241,6 +253,48 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
 
     eprintln!("beskar7-inspector: provisioned, rebooting into the target OS");
     Err(RunError::Deploy(deploy::reboot_now()))
+}
+
+/// The cleaning run (v4.4 §9.3): wipe every eligible disk, report, power off.
+/// With `dry_run` it only prints what it would wipe and contacts nobody.
+fn run_clean(params: &BootParams, dry_run: bool) -> Result<(), RunError> {
+    if dry_run {
+        for (disk, ranges) in clean::plan() {
+            eprintln!(
+                "beskar7-inspector: --dry-run, would wipe {} ({} ranges)",
+                disk.dev_path(),
+                ranges.len()
+            );
+        }
+        return Ok(());
+    }
+
+    let client = CallbackClient::new(params)?;
+    let wiped = match clean::wipe_all_disks() {
+        Ok(wiped) => wiped,
+        Err(e) => {
+            return Err(report_clean_failure(e, |reason| {
+                client.clean_failed(reason)
+            }))
+        }
+    };
+    eprintln!("beskar7-inspector: wiped {}", wiped.join(", "));
+    client.cleaned()?;
+    eprintln!("beskar7-inspector: cleaned callback accepted, powering off");
+    Err(RunError::Deploy(deploy::power_off_now()))
+}
+
+/// Report a failed wipe through `clean_failed` (best effort), then hand it back.
+fn report_clean_failure(
+    e: CleanError,
+    clean_failed: impl FnOnce(&str) -> Result<(), ClientError>,
+) -> RunError {
+    let reason = e.to_string();
+    match clean_failed(&reason) {
+        Ok(()) => eprintln!("beskar7-inspector: clean-failed callback accepted ({reason})"),
+        Err(cb) => eprintln!("beskar7-inspector: clean-failed callback did not land: {cb}"),
+    }
+    RunError::Clean(e)
 }
 
 /// The target disk Phase 2 deploys to, or — when selection failed — the failure,
